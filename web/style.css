@@ -39,11 +39,30 @@ header {
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); flex: none; transition: background .2s; }
 .dot.on { background: var(--ok); }
 
+/* touchpad + dedicated scroll bars: pad top-left, vbar right, hbar bottom */
+#padwrap {
+  flex: 1; display: grid; gap: 8px; margin: 12px 16px;
+  grid-template-columns: 1fr 46px;
+  grid-template-rows: 1fr 46px;
+}
 main#pad {
-  flex: 1; position: relative; margin: 12px 16px;
+  grid-column: 1; grid-row: 1;
+  position: relative;
   background: var(--pad); border: 1px solid var(--line); border-radius: 16px;
   overflow: hidden; touch-action: none;
 }
+#vbar { grid-column: 2; grid-row: 1; }
+#hbar { grid-column: 1; grid-row: 2; }
+.scrollbar {
+  background: var(--pad); border: 1px solid var(--line); border-radius: 12px;
+  touch-action: none; position: relative;
+  display: flex; align-items: center; justify-content: center;
+  transition: border-color .12s, background .12s;
+}
+.scrollbar.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--pad)); }
+.scrollbar .grip { background: var(--line); border-radius: 999px; }
+#vbar .grip { width: 4px; height: 44px; }
+#hbar .grip { width: 44px; height: 4px; }
 #hint {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   text-align: center; padding: 0 32px; color: var(--muted); font-size: 13px; pointer-events: none;

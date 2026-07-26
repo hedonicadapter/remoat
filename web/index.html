@@ -17,9 +17,13 @@
     <span id="status" class="dot" title="disconnected"></span>
   </header>
 
-  <main id="pad" aria-label="touchpad">
-    <div id="hint">touchpad · drag to move · tap = click · two-finger tap = right-click · two-finger drag = scroll</div>
-  </main>
+  <div id="padwrap">
+    <main id="pad" aria-label="touchpad">
+      <div id="hint">touchpad · drag to move · tap = click · two-finger tap = right-click · bars = scroll</div>
+    </main>
+    <div id="vbar" class="scrollbar" aria-label="vertical scroll"><span class="grip"></span></div>
+    <div id="hbar" class="scrollbar" aria-label="horizontal scroll"><span class="grip"></span></div>
+  </div>
 
   <div id="toast"></div>
 

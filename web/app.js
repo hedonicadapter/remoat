@@ -3,7 +3,7 @@
   "use strict";
 
   const SENS = 1.7;        // pointer sensitivity
-  const SCROLL_SENS = 0.6; // two-finger scroll scaling
+  const BAR_SENS = 1.1;    // scroll-bar drag scaling
   const TAP_MS = 250;      // max duration for a tap
   const TAP_SLOP = 10;     // max movement (px) still counted as a tap
 
@@ -111,10 +111,8 @@
     const dx = t.clientX - lastX, dy = t.clientY - lastY;
     lastX = t.clientX; lastY = t.clientY;
     if (Math.abs(t.clientX - startX) > TAP_SLOP || Math.abs(t.clientY - startY) > TAP_SLOP) moved = true;
-    if (e.touches.length >= 2) {
-      scrollAccX += dx * SCROLL_SENS; scrollAccY += dy * SCROLL_SENS;  // two-finger drag = scroll (both axes)
-    } else {
-      pendDx += dx * SENS; pendDy += dy * SENS;
+    if (e.touches.length < 2) {
+      pendDx += dx * SENS; pendDy += dy * SENS;   // single finger = cursor (scroll lives on the bars)
     }
     schedule();
   }, { passive: false });
@@ -129,6 +127,30 @@
     }
     maxTouches = 0;
   }, { passive: false });
+
+  // ---- scroll bars (right = vertical, bottom = horizontal) ----
+  // Drag toward the bottom/right scrolls the target down/right (scrollbar-style).
+  // Signs negate the backend's natural-direction negation; flip a sign if inverted.
+  function bar(el, axis) {
+    let last = null;
+    el.addEventListener("touchstart", (e) => {
+      e.preventDefault(); el.classList.add("active");
+      const t = e.touches[0]; last = axis === "y" ? t.clientY : t.clientX;
+    }, { passive: false });
+    el.addEventListener("touchmove", (e) => {
+      e.preventDefault();
+      const t = e.touches[0];
+      const p = axis === "y" ? t.clientY : t.clientX;
+      const d = p - last; last = p;
+      if (axis === "y") scrollAccY -= d * BAR_SENS; else scrollAccX -= d * BAR_SENS;
+      schedule();
+    }, { passive: false });
+    const end = (e) => { e.preventDefault(); el.classList.remove("active"); last = null; };
+    el.addEventListener("touchend", end, { passive: false });
+    el.addEventListener("touchcancel", end, { passive: false });
+  }
+  bar($("vbar"), "y");
+  bar($("hbar"), "x");
 
   // ---- push-to-talk (Web Speech API) ----
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
