@@ -1,0 +1,10 @@
+{
+  "name": "remoat",
+  "short_name": "remoat",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0e14",
+  "theme_color": "#0b0e14",
+  "start_url": "/",
+  "icons": []
+}

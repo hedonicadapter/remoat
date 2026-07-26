@@ -1,0 +1,14 @@
+/Users/samherman1/Documents/projects/remoat/target/debug/deps/serde-bf93e42796d17c2f.d: /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/samherman1/Documents/projects/remoat/target/debug/build/serde-6aaba764c1dc82d4/out/private.rs
+
+/Users/samherman1/Documents/projects/remoat/target/debug/deps/libserde-bf93e42796d17c2f.rlib: /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/samherman1/Documents/projects/remoat/target/debug/build/serde-6aaba764c1dc82d4/out/private.rs
+
+/Users/samherman1/Documents/projects/remoat/target/debug/deps/libserde-bf93e42796d17c2f.rmeta: /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/samherman1/Documents/projects/remoat/target/debug/build/serde-6aaba764c1dc82d4/out/private.rs
+
+/Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/samherman1/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/samherman1/Documents/projects/remoat/target/debug/build/serde-6aaba764c1dc82d4/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/samherman1/Documents/projects/remoat/target/debug/build/serde-6aaba764c1dc82d4/out

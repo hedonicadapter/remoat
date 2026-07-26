@@ -1,0 +1,29 @@
+[package]
+name = "remoat"
+version = "0.1.0"
+edition = "2021"
+description = "Phone→desktop remote control daemon (touchpad + push-to-talk)"
+
+[[bin]]
+name = "remoat"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower-http = { version = "0.6", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mdns-sd = "0.11"
+rcgen = "0.13"
+gethostname = "0.5"
+regex = "1"
+
+# enigo (Quartz) only on macOS. Linux uses ydotool (uinput — works on X11 and Wayland),
+# so we avoid enigo's X11/Wayland system-lib build deps on Linux entirely.
+[target.'cfg(target_os = "macos")'.dependencies]
+enigo = "0.2"
+
+[profile.release]
+opt-level = 2
