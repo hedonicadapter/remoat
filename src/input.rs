@@ -195,14 +195,14 @@ impl Backend for YdotoolBackend {
         if double { self.run(&["click".into(), code.into()]); }
     }
     fn scroll(&mut self, dx: f64, dy: f64) {
-        // --wheel with -x (horizontal) / -y (vertical); horizontal wheel is the least
-        // version-stable part of ydotool — vertical still works if -x is ignored.
+        // Wheel mode is `-w` (short) on the ReimuNotMoe ydotool; the long `--wheel` is
+        // rejected. In wheel mode -x = horizontal notches, -y = vertical notches.
         let v = (-dy / 40.0).round() as i32;
         let h = (-dx / 40.0).round() as i32;
         if v == 0 && h == 0 {
             return;
         }
-        let mut args = vec!["mousemove".to_string(), "--wheel".to_string()];
+        let mut args = vec!["mousemove".to_string(), "-w".to_string()];
         if h != 0 { args.push("-x".into()); args.push(h.to_string()); }
         if v != 0 { args.push("-y".into()); args.push(v.to_string()); }
         self.run(&args);
