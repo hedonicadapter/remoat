@@ -27,7 +27,7 @@
     ws.onerror = () => showToast("connection error", "err");
     ws.onmessage = (e) => {
       let m; try { m = JSON.parse(e.data); } catch (_) { return; }
-      if (m.type === "devices") populateDevices(m.devices);
+      if (m.type === "devices") mergeDevices(m.devices);
       else if (m.type === "command_result") showToast(m.message || m.label, m.ok ? "ok" : "err");
     };
   }
@@ -35,23 +35,39 @@
   function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
   // ---- device dropdown ----
-  function populateDevices(devices) {
-    if (!devices || !devices.length) return;
-    const cur = deviceSel.value;
-    deviceSel.innerHTML = "";
+  // Accumulate every device we've ever seen. Each daemon's `devices` message is only
+  // its own momentary mDNS view; rebuilding from it alone would drop peers whose mDNS
+  // record briefly lapsed. Merge instead so a device never vanishes mid-session.
+  const known = new Map();   // "host:port" -> {name, platform, host, port, val}
+  let currentVal = null;     // the daemon the WS is actually connected to
+
+  function mergeDevices(devices) {
+    if (!devices) return;
+    let connectedTo = null;
     for (const d of devices) {
       const val = `${d.host}:${d.port}`;
+      known.set(val, { name: d.name, platform: d.platform, host: d.host, port: d.port, val });
+      if (d.self) connectedTo = val;   // the reporting daemon = the one we're on
+    }
+    if (connectedTo) currentVal = connectedTo;
+    renderDevices();
+  }
+
+  function renderDevices() {
+    deviceSel.innerHTML = "";
+    for (const d of known.values()) {
       const o = document.createElement("option");
-      o.value = val;
-      o.textContent = `${d.name} · ${d.platform}${d.self ? "" : ""}`;
-      if (d.self && !cur) o.selected = true;
+      o.value = d.val;
+      o.textContent = `${d.name} · ${d.platform}`;
       deviceSel.appendChild(o);
     }
-    if (cur) deviceSel.value = cur;
+    if (currentVal && known.has(currentVal)) deviceSel.value = currentVal;
   }
+
   deviceSel.addEventListener("change", () => {
-    const [host] = [deviceSel.value];
-    // Reconnect to selected daemon; self keeps current origin
+    const host = deviceSel.value;
+    currentVal = host;   // remember selection so a device-list refresh doesn't reset it
+    // Reconnect to selected daemon; the served origin reconnects same-origin.
     connect(host === `${location.hostname}:${location.port || 443}` ? null : host);
     showToast(`switched to ${deviceSel.selectedOptions[0].textContent}`);
   });
