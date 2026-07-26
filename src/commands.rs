@@ -36,7 +36,7 @@ fn input_action(q: &str) -> Option<(String, InputCmd)> {
     if let Some(c) = re(r"\bscroll (down|up)\b").captures(q) {
         let dir = &c[1];
         let dy = if dir == "down" { -120.0 } else { 120.0 };
-        return Some((format!("scroll {dir}"), InputCmd::Scroll { dy }));
+        return Some((format!("scroll {dir}"), InputCmd::Scroll { dx: 0.0, dy }));
     }
     if re(r"\bgo back\b").is_match(q) { return Some(("go back".into(), InputCmd::Hotkey(nav("back")))); }
     if re(r"\bgo forward\b").is_match(q) { return Some(("go forward".into(), InputCmd::Hotkey(nav("forward")))); }

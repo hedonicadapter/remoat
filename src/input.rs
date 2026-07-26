@@ -14,7 +14,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 pub enum InputCmd {
     Move { dx: f64, dy: f64 },
     Click { button: String, double: bool },
-    Scroll { dy: f64 },
+    Scroll { dx: f64, dy: f64 },
     Text(String),
     Hotkey(Vec<String>),
     Key(String),
@@ -24,7 +24,7 @@ pub trait Backend {
     fn name(&self) -> &'static str;
     fn move_rel(&mut self, dx: f64, dy: f64);
     fn click(&mut self, button: &str, double: bool);
-    fn scroll(&mut self, dy: f64);
+    fn scroll(&mut self, dx: f64, dy: f64);
     fn text(&mut self, s: &str);
     fn hotkey(&mut self, keys: &[String]);
     fn key(&mut self, k: &str);
@@ -33,7 +33,7 @@ pub trait Backend {
         match cmd {
             InputCmd::Move { dx, dy } => self.move_rel(dx, dy),
             InputCmd::Click { button, double } => self.click(&button, double),
-            InputCmd::Scroll { dy } => self.scroll(dy),
+            InputCmd::Scroll { dx, dy } => self.scroll(dx, dy),
             InputCmd::Text(s) => self.text(&s),
             InputCmd::Hotkey(keys) => self.hotkey(&keys),
             InputCmd::Key(k) => self.key(&k),
@@ -128,9 +128,12 @@ impl Backend for EnigoBackend {
         let _ = self.enigo.button(b, Direction::Click);
         if double { let _ = self.enigo.button(b, Direction::Click); }
     }
-    fn scroll(&mut self, dy: f64) {
-        let lines = (-dy / 40.0).round() as i32; // natural direction, px -> notches
-        if lines != 0 { let _ = self.enigo.scroll(lines, Axis::Vertical); }
+    fn scroll(&mut self, dx: f64, dy: f64) {
+        // px -> notches; signs tuned for natural direction (flip if inverted)
+        let v = (-dy / 40.0).round() as i32;
+        let h = (-dx / 40.0).round() as i32;
+        if v != 0 { let _ = self.enigo.scroll(v, Axis::Vertical); }
+        if h != 0 { let _ = self.enigo.scroll(h, Axis::Horizontal); }
     }
     fn text(&mut self, s: &str) { let _ = self.enigo.text(s); }
     fn hotkey(&mut self, keys: &[String]) {
@@ -191,11 +194,18 @@ impl Backend for YdotoolBackend {
         self.run(&["click".into(), code.into()]);
         if double { self.run(&["click".into(), code.into()]); }
     }
-    fn scroll(&mut self, dy: f64) {
-        let clicks = (-dy / 40.0).round() as i32;
-        if clicks != 0 {
-            self.run(&["mousemove".into(), "--wheel".into(), "-y".into(), clicks.to_string()]);
+    fn scroll(&mut self, dx: f64, dy: f64) {
+        // --wheel with -x (horizontal) / -y (vertical); horizontal wheel is the least
+        // version-stable part of ydotool — vertical still works if -x is ignored.
+        let v = (-dy / 40.0).round() as i32;
+        let h = (-dx / 40.0).round() as i32;
+        if v == 0 && h == 0 {
+            return;
         }
+        let mut args = vec!["mousemove".to_string(), "--wheel".to_string()];
+        if h != 0 { args.push("-x".into()); args.push(h.to_string()); }
+        if v != 0 { args.push("-y".into()); args.push(v.to_string()); }
+        self.run(&args);
     }
     fn text(&mut self, s: &str) {
         if !self.dryrun && wl_copy(s) {
@@ -231,7 +241,7 @@ impl Backend for NullBackend {
     fn name(&self) -> &'static str { "null" }
     fn move_rel(&mut self, _: f64, _: f64) {}
     fn click(&mut self, _: &str, _: bool) {}
-    fn scroll(&mut self, _: f64) {}
+    fn scroll(&mut self, _: f64, _: f64) {}
     fn text(&mut self, _: &str) {}
     fn hotkey(&mut self, _: &[String]) {}
     fn key(&mut self, _: &str) {}

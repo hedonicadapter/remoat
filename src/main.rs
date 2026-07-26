@@ -75,8 +75,9 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                 let _ = st.tx.send(InputCmd::Click { button, double });
             }
             "scroll" => {
+                let dx = v.get("dx").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 let dy = v.get("dy").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let _ = st.tx.send(InputCmd::Scroll { dy });
+                let _ = st.tx.send(InputCmd::Scroll { dx, dy });
             }
             "text" => {
                 if let Some(t) = v.get("text").and_then(|x| x.as_str()) {

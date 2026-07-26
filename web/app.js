@@ -83,12 +83,15 @@
 
   // ---- touchpad ----
   let lastX = 0, lastY = 0, startX = 0, startY = 0, startT = 0;
-  let maxTouches = 0, moved = false, pendDx = 0, pendDy = 0, scrollAcc = 0, rafPending = false;
+  let maxTouches = 0, moved = false, pendDx = 0, pendDy = 0, scrollAccX = 0, scrollAccY = 0, rafPending = false;
 
   function flush() {
     rafPending = false;
     if (pendDx || pendDy) { send({ type: "move", dx: pendDx, dy: pendDy }); pendDx = pendDy = 0; }
-    if (Math.abs(scrollAcc) >= 1) { send({ type: "scroll", dy: Math.round(scrollAcc) }); scrollAcc = 0; }
+    if (Math.abs(scrollAccX) >= 1 || Math.abs(scrollAccY) >= 1) {
+      send({ type: "scroll", dx: Math.round(scrollAccX), dy: Math.round(scrollAccY) });
+      scrollAccX = scrollAccY = 0;
+    }
   }
   function schedule() { if (!rafPending) { rafPending = true; requestAnimationFrame(flush); } }
 
@@ -109,7 +112,7 @@
     lastX = t.clientX; lastY = t.clientY;
     if (Math.abs(t.clientX - startX) > TAP_SLOP || Math.abs(t.clientY - startY) > TAP_SLOP) moved = true;
     if (e.touches.length >= 2) {
-      scrollAcc += dy * SCROLL_SENS;   // two-finger drag = scroll
+      scrollAccX += dx * SCROLL_SENS; scrollAccY += dy * SCROLL_SENS;  // two-finger drag = scroll (both axes)
     } else {
       pendDx += dx * SENS; pendDy += dy * SENS;
     }
