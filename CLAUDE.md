@@ -46,7 +46,7 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
 ## Run
 
 - `nix run github:hedonicadapter/remoat` (Linux + macOS). `--port N` to change port.
-- From source: `nix develop .#rust --command cargo run`.
+- From source: `nix develop --command cargo run` (devShells.default has cargo + cmake).
 - macOS injection needs Accessibility granted to the launching terminal (rotating
   `/nix/store` path makes granting the store binary impractical — grant the terminal).
 

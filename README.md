@@ -58,7 +58,7 @@ nix build  github:hedonicadapter/remoat       # ./result/bin/remoat
 
 ```bash
 cd ~/Documents/projects/remoat
-nix develop .#rust --command cargo run          # or: cargo run -- --port 9000
+nix develop --command cargo run                 # or: cargo run -- --port 9000
 ```
 `REMOAT_WEB_DIR` defaults to `./web` from the source tree, so `cargo run` finds the PWA.
 
