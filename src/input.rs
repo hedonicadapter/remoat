@@ -196,16 +196,18 @@ impl Backend for YdotoolBackend {
     }
     fn scroll(&mut self, dx: f64, dy: f64) {
         // Wheel mode is `-w` (short) on the ReimuNotMoe ydotool; the long `--wheel` is
-        // rejected. In wheel mode -x = horizontal notches, -y = vertical notches.
+        // rejected. It also requires BOTH -x and -y present — omitting the zero axis
+        // makes it reject the call and dump usage. -x = horizontal, -y = vertical notches.
         let v = (-dy / 40.0).round() as i32;
         let h = (-dx / 40.0).round() as i32;
         if v == 0 && h == 0 {
             return;
         }
-        let mut args = vec!["mousemove".to_string(), "-w".to_string()];
-        if h != 0 { args.push("-x".into()); args.push(h.to_string()); }
-        if v != 0 { args.push("-y".into()); args.push(v.to_string()); }
-        self.run(&args);
+        self.run(&[
+            "mousemove".into(), "-w".into(),
+            "-x".into(), h.to_string(),
+            "-y".into(), v.to_string(),
+        ]);
     }
     fn text(&mut self, s: &str) {
         if !self.dryrun && wl_copy(s) {
