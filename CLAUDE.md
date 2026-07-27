@@ -18,6 +18,31 @@ but unexercised (no Linux builder here) — see "Open threads".
 Debug without speaking: `remoat --check "delete 3 words"` prints the resolution (no
 injection); `remoat --actions` lists the allowlist + the user table path.
 
+**Multi-device arrangement + edge crossing BUILT** (replaces the device dropdown). Devices are
+laid out like monitors and share ONE cursor: shove it off an edge and it continues onto the
+bordering device. Design consequences worth understanding before changing any of it:
+- **The app owns the cursor.** Nothing can ask Wayland where the pointer is (uinput is
+  write-only), so the phone integrates touch deltas into a global position and sends
+  `move_abs`; the daemon reports its bounds (`screen` frame) and clamps. Relative `move` is
+  still handled for older clients.
+- **One coordinate space.** Every device is a rect in the same space, so a crossing needs no
+  mapping maths — the global coordinate is continuous across the seam, which is why you exit
+  and enter at the same height. Geometry lives in `web/arrange.js` (pure, unit-tested).
+- **A socket per device, all open at once**, because a crossing must be instant. Peers need
+  their self-signed cert accepted once; a never-opened socket is reported as `untrusted` and
+  its tile offers to open that device's page so the browser can take the exception.
+- **Crossing takes a deliberate shove** (`PUSH`, 60px banked past the edge) and only where the
+  rects actually overlap perpendicular to the seam, so a diagonal neighbour can't catch you.
+- Layout + active device persist in `localStorage`; devices are keyed by daemon **name**, not
+  host:port, so DHCP churn doesn't scramble the arrangement.
+- The wake lock follows the active device: crossing releases the one you left.
+
+Verified end-to-end on this Mac: two daemons (1800x1169 and 2560x1440) on ports 8501/8502 with
+`REMOAT_BACKEND=ydotool REMOAT_DRYRUN=1`, driven by the real `arrange.js` through real
+WebSockets — the left daemon pinned at `-x 1799`, the right one received `-x 0 -y 585` on the
+crossing (same height), the return crossing landed back on the left, and the wake lock moved
+with it. 17 geometry tests (`node --test web/arrange.test.mjs`).
+
 **Wake lock BUILT** (`src/wake.rs`): the selected desktop won't auto-lock while the PWA is
 focused. Client sends `{type:"wake",on:…}` on focus/visibility change plus a 30s heartbeat;
 daemon holds an inhibitor process, refcounted across clients. Verified on this Mac: assertion
@@ -64,6 +89,10 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   (and/then/comma), repeat suffix (`twice`, `3 times`, `x4`), `{n}` count slot.
 - `src/config.rs` — command table: embedded `src/commands.default.toml` + user
   `commands.toml` merged on top, re-read on mtime change, per-rule fail-soft validation.
+- `src/screen.rs` — desktop bounds (env override → Quartz via enigo → hyprctl/wlr-randr/xrandr
+  → 1920x1080). Origin assumed 0,0; also clamps incoming `move_abs`.
+- `web/arrange.js` — arrangement + edge-crossing geometry, pure and DOM-free so it can be
+  unit-tested (`web/arrange.test.mjs`). `web/app.js` is an ES module because of this import.
 - `src/wake.rs` — wake lock: holds `caffeinate -d -i -w <pid>` (mac) / `systemd-inhibit …
   tail --pid=<pid>` (Linux) while any client says it's focused. Refcounted; released on
   blur, on 90s client silence, on disconnect, and on SIGINT/SIGTERM.
@@ -94,6 +123,15 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   unit-tested (`input.rs::keyargs`), the *bindings* aren't.
 - PWA settings screen that edits `commands.toml` over WS (`{type:"config_set",…}`) — the
   file format is ready for it; the WS message is not implemented.
+- Arrangement gaps worth knowing: bounds are ONE rect per device starting at 0,0 — on mac
+  that's the main display only (enigo has no virtual-desktop query), so a second monitor on a
+  mac isn't reachable by crossing. Linux unions its monitors via hyprctl/wlr-randr, so it is.
+  `REMOAT_SCREEN=WxH` is the manual override.
+- The layout is per-phone (localStorage). Sharing it across clients means persisting it on the
+  daemons — the `config_set`-style seam below is the natural place.
+- Devices are keyed by daemon name, so two daemons with the SAME hostname (e.g. two on one
+  box, as in the crossing test) collide into one tile. Fine on a real LAN; don't be surprised
+  in tests.
 - Confirm the wake lock on the nixos box: `systemd-inhibit --what=idle:sleep … tail --pid=N`
   argv is untested, and hypridle only honours logind inhibitors when
   `ignore_dbus_inhibit=false` (its default). `wlinhibit` is the no-logind fallback and is the

@@ -144,6 +144,27 @@ it. On Linux, install `systemd-inhibit` (systemd) or `wlinhibit`; without either
 logs `[wake] inhibitor: unavailable (…)` at startup and the app toasts once. `REMOAT_WAKE=off`
 disables the feature.
 
+## Arranging devices (and crossing between them)
+Tap the device name in the header to open the arrangement. Every device you can see is a tile
+sized to its screen — **drag** them into the layout your machines actually sit in (tiles snap
+to each other's edges), and the cursor treats that layout as one big desktop:
+
+- **Push the cursor off an edge** and it continues onto whichever device borders that edge, at
+  the same height it left. It takes a deliberate shove (~60px past the edge), so ordinary
+  overshoot doesn't fling you onto the neighbour.
+- **Tap a tile** to jump straight to that device.
+- Devices only hand over where their tiles actually touch, so a machine parked diagonally
+  won't grab your cursor.
+- The layout, and which device is active, are remembered on that phone.
+
+Everything else — clicks, scrolling, dictation, voice commands, the wake lock — follows the
+cursor to whichever device it's on.
+
+> **Each device's certificate must be accepted once.** Tiles for devices the browser hasn't
+> trusted yet show `tap to trust`; tapping opens that device's page so you can accept its
+> self-signed cert, after which its tile connects and becomes crossable. Until then the cursor
+> refuses to cross into it (it would have nowhere accurate to land) and says so.
+
 ## Gestures
 | gesture | action |
 |---|---|
@@ -215,8 +236,12 @@ file still loads. `src/commands.default.toml` is the built-in table; it's the be
   side whisper.cpp path (see above) is the robust upgrade.
 - No pairing/auth yet. Before real use: device pairing + per-device token, and keep
   the action surface bounded (already the case).
-- Multi-device: selecting a *different* daemon needs that daemon's cert trusted too
-  (self-signed). Fine for single-machine testing.
+- Multi-device: each daemon's self-signed cert must be accepted once in the browser before
+  its tile connects and the cursor can cross into it (the tile says `tap to trust`).
+- Arrangement uses one rectangle per device, starting at its top-left. On macOS that's the
+  main display only, so a mac's second monitor isn't reachable by crossing; Linux unions its
+  monitors (hyprctl/wlr-randr). Override with `REMOAT_SCREEN=WxH`.
+- The arrangement is stored per phone (localStorage), not shared between clients.
 
 ## Layout
 ```
@@ -227,11 +252,15 @@ src/             Rust daemon (the one the flake builds)
   actions.rs     the bounded action allowlist (platform-mapped chords)
   voice.rs       speech normalization, counts, chain splitting
   wake.rs        holds off auto-lock while the app is focused (refcounted inhibitor)
+  screen.rs      desktop bounds, for the phone's absolute cursor
   config.rs      command table: embedded default + user commands.toml (hot-reloaded)
   commands.default.toml   built-in command table = the default config
   discovery.rs   mdns-sd advertise/browse
   tls.rs         self-signed cert (rcgen) in $XDG_STATE_HOME
-web/             the PWA (index.html, app.js, style.css, manifest.json)
+web/             the PWA (ES modules)
+  app.js         touchpad, device pool, arrangement UI, push-to-talk
+  arrange.js     arrangement + edge-crossing geometry (pure)
+  arrange.test.mjs  its tests — `node --test web/arrange.test.mjs`
 daemon/          legacy Python POC (reference only)
 flake.nix        buildRustPackage + apps.default (nix run)
 ```
