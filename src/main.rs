@@ -1,16 +1,19 @@
 //! remoat daemon — serves the PWA, a WebSocket control channel, over HTTPS.
 //!
 //! Protocol (JSON over WS):
-//!   client -> server: {type:"hello"|"move"|"click"|"scroll"|"text"|"command"|"ping", ...}
-//!   server -> client: {type:"devices"|"command_result"|"pong", ...}
+//!   client -> server: {type:"hello"|"move"|"move_abs"|"click"|"scroll"|"text"|"command"
+//!                          |"wake"|"ping", ...}
+//!   server -> client: {type:"devices"|"screen"|"command_result"|"wake_state"|"pong", ...}
 
 mod actions;
 mod commands;
 mod config;
 mod discovery;
 mod input;
+mod screen;
 mod tls;
 mod voice;
+mod wake;
 
 use std::net::SocketAddr;
 
@@ -30,12 +33,21 @@ use commands::Exec;
 use discovery::Discovery;
 use input::InputCmd;
 use std::sync::Arc;
+use wake::WakeLock;
 
 #[derive(Clone)]
 struct AppState {
     tx: UnboundedSender<InputCmd>,
     disc: Arc<Discovery>,
+    wake: Arc<WakeLock>,
+    screen: screen::Bounds,
+    name: String,
 }
+
+/// Drop a client's wake lock if it goes quiet this long. The phone holds the lock while
+/// focused and heartbeats to keep it; a pocketed phone whose socket never closes (dropped
+/// Wi-Fi, killed tab) must not pin the display on indefinitely.
+const WAKE_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
 
 fn web_dir() -> String {
     std::env::var("REMOAT_WEB_DIR").unwrap_or_else(|_| "web".into())
@@ -50,13 +62,41 @@ async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> impl In
     ws.on_upgrade(move |socket| handle_socket(socket, st))
 }
 
+/// Who am I and how big is my desktop — one frame, sent unprompted on connect so the app
+/// never has to ask before arranging.
+fn screen_frame(st: &AppState) -> String {
+    json!({"type":"screen","name":st.name,"platform":discovery::platform_label(),
+           "w":st.screen.w,"h":st.screen.h})
+    .to_string()
+}
+
 async fn handle_socket(mut socket: WebSocket, st: AppState) {
-    // Push device list on connect.
+    // Identify ourselves BEFORE the peer list: the app keys devices by name, so it has to
+    // learn who this connection is before the same daemon shows up in `devices` — otherwise
+    // it can't tell that entry is us and opens a second socket to itself.
+    let _ = socket.send(Message::Text(screen_frame(&st))).await;
     let _ = socket
         .send(Message::Text(json!({"type":"devices","devices": st.disc.devices()}).to_string()))
         .await;
 
-    while let Some(Ok(msg)) = socket.recv().await {
+    // At most one wake reference per connection, released on blur, idle, or disconnect.
+    let mut holding = false;
+
+    loop {
+        let msg = match tokio::time::timeout(WAKE_IDLE, socket.recv()).await {
+            Ok(Some(Ok(m))) => m,
+            Ok(_) => break, // closed or errored
+            Err(_) => {
+                // Gone quiet: give the machine its screen lock back, keep serving. The
+                // client's next heartbeat re-acquires.
+                if holding {
+                    st.wake.release();
+                    holding = false;
+                    eprintln!("[wake] client idle {}s — released", WAKE_IDLE.as_secs());
+                }
+                continue;
+            }
+        };
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
@@ -71,6 +111,14 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                 let dx = v.get("dx").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 let dy = v.get("dy").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 let _ = st.tx.send(InputCmd::Move { dx, dy });
+            }
+            // Arranged devices: the app tracks the cursor and sends where it should be, so
+            // a crossing can land the pointer on the exact entry edge of the next device.
+            "move_abs" => {
+                let x = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0) as i32;
+                let y = v.get("y").and_then(|x| x.as_f64()).unwrap_or(0.0) as i32;
+                let (x, y) = st.screen.clamp(x, y);
+                let _ = st.tx.send(InputCmd::MoveAbs { x, y });
             }
             "click" => {
                 let button = v.get("button").and_then(|x| x.as_str()).unwrap_or("left").to_string();
@@ -143,7 +191,28 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                     .await;
                 eprintln!("[cmd] {t:?} -> {message}");
             }
+            // Focus-follows-wake-lock: the app sends on:true while it's focused (plus a
+            // heartbeat), on:false when hidden. One reference per connection, so a repeated
+            // on:true is idempotent rather than a leak.
+            "wake" => {
+                let on = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
+                if on && !holding {
+                    st.wake.acquire();
+                    holding = true;
+                } else if !on && holding {
+                    st.wake.release();
+                    holding = false;
+                }
+                let _ = socket
+                    .send(Message::Text(
+                        json!({"type":"wake_state","held":holding,"available":st.wake.available(),
+                               "clients":st.wake.holders()})
+                            .to_string(),
+                    ))
+                    .await;
+            }
             "hello" => {
+                let _ = socket.send(Message::Text(screen_frame(&st))).await;
                 let _ = socket
                     .send(Message::Text(json!({"type":"devices","devices": st.disc.devices()}).to_string()))
                     .await;
@@ -153,6 +222,12 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
             }
             _ => {}
         }
+    }
+
+    // Socket closed: phone locked, tab killed, device switched away. Never leave the
+    // inhibitor held for a client that's gone.
+    if holding {
+        st.wake.release();
     }
 }
 
@@ -219,6 +294,26 @@ fn check(phrase: &str) {
     }
 }
 
+/// Ctrl-C / SIGTERM: drop the wake lock before exiting. The inhibitor is also leashed to
+/// this pid, so this is the fast path, not the only one — a SIGKILL still ends up released.
+fn spawn_shutdown_release(wake: Arc<WakeLock>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match term.as_mut() {
+                    Some(t) => { t.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+        wake.release_all();
+        std::process::exit(0);
+    });
+}
+
 #[tokio::main]
 async fn main() {
     let (host, port, mode) = parse_args();
@@ -233,12 +328,16 @@ async fn main() {
     let tx = input::spawn_worker();
     let disc = Discovery::start(name.clone(), ip.clone(), port);
     let (cert_pem, key_pem) = tls::ensure_cert();
+    let wake = Arc::new(WakeLock::detect());
+    eprintln!("[wake] inhibitor: {}", wake.describe());
+    spawn_shutdown_release(wake.clone());
+    let bounds = screen::detect();
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/", get(index))
         .fallback_service(ServeDir::new(web_dir()))
-        .with_state(AppState { tx, disc });
+        .with_state(AppState { tx, disc, wake, screen: bounds, name: name.clone() });
 
     let config = RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
         .await
