@@ -18,6 +18,13 @@ but unexercised (no Linux builder here) — see "Open threads".
 Debug without speaking: `remoat --check "delete 3 words"` prints the resolution (no
 injection); `remoat --actions` lists the allowlist + the user table path.
 
+**Wake lock BUILT** (`src/wake.rs`): the selected desktop won't auto-lock while the PWA is
+focused. Client sends `{type:"wake",on:…}` on focus/visibility change plus a 30s heartbeat;
+daemon holds an inhibitor process, refcounted across clients. Verified on this Mac: assertion
+appears/disappears with focus, survives one of two clients leaving, and is released on clean
+close, abrupt socket drop, 90s client silence, SIGTERM **and SIGKILL**. Linux inhibitor
+argv is unexercised (no Linux box) — see "Open threads".
+
 **Daemon rewritten from Python to Rust** (`src/`). Reason: Python packaging friction
 under Nix (pyautogui pulls Linux-only `scrot`, venv/pyobjc mess). Rust = single binary,
 clean `buildRustPackage`, `nix run` works on darwin + Linux. The PWA (`web/`) and the WS
@@ -57,6 +64,9 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   (and/then/comma), repeat suffix (`twice`, `3 times`, `x4`), `{n}` count slot.
 - `src/config.rs` — command table: embedded `src/commands.default.toml` + user
   `commands.toml` merged on top, re-read on mtime change, per-rule fail-soft validation.
+- `src/wake.rs` — wake lock: holds `caffeinate -d -i -w <pid>` (mac) / `systemd-inhibit …
+  tail --pid=<pid>` (Linux) while any client says it's focused. Refcounted; released on
+  blur, on 90s client silence, on disconnect, and on SIGINT/SIGTERM.
 - `src/discovery.rs` — mdns-sd advertise + browse.
 - `src/tls.rs` — self-signed cert via rcgen, in `$XDG_STATE_HOME/remoat` (or
   `REMOAT_CERT_DIR`). `REMOAT_WEB_DIR` points at the PWA (flake sets it; defaults `./web`).
@@ -84,6 +94,10 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   unit-tested (`input.rs::keyargs`), the *bindings* aren't.
 - PWA settings screen that edits `commands.toml` over WS (`{type:"config_set",…}`) — the
   file format is ready for it; the WS message is not implemented.
+- Confirm the wake lock on the nixos box: `systemd-inhibit --what=idle:sleep … tail --pid=N`
+  argv is untested, and hypridle only honours logind inhibitors when
+  `ignore_dbus_inhibit=false` (its default). `wlinhibit` is the no-logind fallback and is the
+  one path with no pid leash, so it leans on the SIGTERM handler alone.
 
 ## Voice commands + command table (as built)
 
@@ -136,6 +150,12 @@ Where the implementation deviates from the original design note:
 ## Gotchas (hard-won — don't rediscover)
 
 - **`lsof` hangs on the dev Mac** — use `pgrep`/`pkill` or a Python bind-test instead.
+- **An inhibitor child outlives a killed daemon.** Measured: SIGTERM to the daemon left
+  `caffeinate -d -i` asserting forever (nothing runs `Drop`). Hence the pid leash
+  (`caffeinate -w <pid>`, `tail --pid=<pid>`) — the signal handler alone can't cover SIGKILL.
+- **This Mac already runs an unrelated `caffeinate -d -i -u -t 1800`** (some other tool). When
+  checking assertions, match our exact argv (`caffeinate -d -i -w`), or you'll misread it as
+  a leak. `pmset -g assertions` also lists recently-dead pids, so confirm with `kill -0`.
 - **rustls pulls `aws-lc-sys`** → the nix build needs `cmake` + `perl` in
   `nativeBuildInputs` (already added). A bare `cargo build` only worked locally because
   this Mac had `cmake` on PATH.

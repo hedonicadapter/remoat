@@ -132,6 +132,18 @@ REMOAT_BACKEND=ydotool REMOAT_DRYRUN=1 ./run.sh   # logs `ydotool …` argv inst
 > (`YdotoolBackend`). Scroll uses `mousemove --wheel`, which is the least version-
 > stable call — most likely to need a tweak.
 
+## Screen stays awake while you're using it
+While the app is focused, the **selected** desktop won't auto-lock or sleep its display —
+otherwise the machine you're driving locks itself while you're looking at the phone. The
+daemon holds a real inhibitor (`caffeinate` on macOS, `systemd-inhibit` or `wlinhibit` on
+Linux) and drops it as soon as the app is backgrounded, the phone locks, you switch devices,
+or the app goes quiet for 90 seconds. Switching devices moves the lock with you.
+
+Nothing is left holding the machine awake if the daemon is killed — the inhibitor exits with
+it. On Linux, install `systemd-inhibit` (systemd) or `wlinhibit`; without either, the daemon
+logs `[wake] inhibitor: unavailable (…)` at startup and the app toasts once. `REMOAT_WAKE=off`
+disables the feature.
+
 ## Gestures
 | gesture | action |
 |---|---|
@@ -214,6 +226,7 @@ src/             Rust daemon (the one the flake builds)
   commands.rs    intent router: command table → steps, + LLM seam
   actions.rs     the bounded action allowlist (platform-mapped chords)
   voice.rs       speech normalization, counts, chain splitting
+  wake.rs        holds off auto-lock while the app is focused (refcounted inhibitor)
   config.rs      command table: embedded default + user commands.toml (hot-reloaded)
   commands.default.toml   built-in command table = the default config
   discovery.rs   mdns-sd advertise/browse
