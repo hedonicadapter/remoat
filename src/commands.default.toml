@@ -1,0 +1,269 @@
+# remoat built-in command table. This file IS the default config — same schema as
+# $XDG_CONFIG_HOME/remoat/commands.toml, which is merged on top and matched FIRST
+# (so a user rule with the same phrase overrides the default below).
+#
+# A rule = phrases → exactly one action kind:
+#   action  = "delete_word"                  registry name (platform-mapped, see actions.rs)
+#   keys    = ["ctrl", "c"]                  raw chord, same on every platform
+#   keys_mac / keys_linux = [...]            per-platform chord
+#   text    = "literal text"                 typed verbatim
+#   launch / launch_mac / launch_linux       argv (no shell — argv only, by design)
+#   sequence = [{action="enter"}, ...]       compose the above, in order
+#   clarify = "select what?"                 matched but deliberately does nothing
+# Options: label = "…" (toast text), regex = true (phrases are regexes, not aliases).
+#
+# `{n}` in a phrase captures a count ("delete 3 words"); a trailing "twice" / "3 times" /
+# "x4" also repeats any rule. Text is normalized before matching: lowercased, punctuation
+# stripped, number words → digits — so write "delete 2 lines", never "delete two lines".
+
+version = 1
+
+# ─── editing ──────────────────────────────────────────────────────────────────
+[[rules]]
+phrases = ["backspace", "delete", "delete character", "delete {n} characters", "backspace {n}"]
+action = "backspace"
+
+[[rules]]
+phrases = ["forward delete", "delete forward", "delete right", "delete {n} right"]
+action = "forward_delete"
+
+[[rules]]
+phrases = ["delete word", "delete the word", "delete {n} words", "backspace word", "scratch that"]
+action = "delete_word"
+
+[[rules]]
+phrases = ["delete line", "delete the line", "clear line", "kill line"]
+action = "delete_line"
+
+[[rules]]
+phrases = ["undo", "undo that"]
+action = "undo"
+
+[[rules]]
+phrases = ["redo", "redo that"]
+action = "redo"
+
+[[rules]]
+phrases = ["copy", "copy that"]
+action = "copy"
+
+[[rules]]
+phrases = ["cut", "cut that"]
+action = "cut"
+
+[[rules]]
+phrases = ["paste", "paste that", "paste {n} times"]
+action = "paste"
+
+[[rules]]
+phrases = ["save", "save it", "save file", "save the file"]
+action = "save"
+
+[[rules]]
+phrases = ["find", "search", "find in page"]
+action = "find"
+
+[[rules]]
+phrases = ["select all", "select everything"]
+action = "select_all"
+
+[[rules]]
+phrases = ["select word", "select the word", "select {n} words"]
+action = "select_word"
+
+[[rules]]
+phrases = ["select line", "select the line"]
+action = "select_line"
+
+# ─── caret / navigation ───────────────────────────────────────────────────────
+[[rules]]
+phrases = ["left", "go left", "arrow left", "left {n}", "{n} left"]
+action = "left"
+
+[[rules]]
+phrases = ["right", "go right", "arrow right", "right {n}", "{n} right"]
+action = "right"
+
+[[rules]]
+phrases = ["up", "go up", "arrow up", "up {n}", "{n} up"]
+action = "up"
+
+[[rules]]
+phrases = ["down", "go down", "arrow down", "down {n}", "{n} down"]
+action = "down"
+
+[[rules]]
+phrases = ["word left", "left word", "back word", "{n} words left"]
+action = "word_left"
+
+[[rules]]
+phrases = ["word right", "right word", "forward word", "{n} words right"]
+action = "word_right"
+
+[[rules]]
+phrases = ["line start", "start of line", "beginning of line", "home"]
+action = "line_start"
+
+[[rules]]
+phrases = ["line end", "end of line", "end"]
+action = "line_end"
+
+[[rules]]
+phrases = ["top", "go to top", "top of document", "document start"]
+action = "doc_start"
+
+[[rules]]
+phrases = ["bottom", "go to bottom", "end of document", "document end"]
+action = "doc_end"
+
+[[rules]]
+phrases = ["page up", "page up {n}"]
+action = "page_up"
+
+[[rules]]
+phrases = ["page down", "page down {n}"]
+action = "page_down"
+
+[[rules]]
+phrases = ["enter", "return", "confirm", "new line", "newline"]
+action = "enter"
+
+[[rules]]
+phrases = ["escape", "cancel", "dismiss", "never mind"]
+action = "escape"
+
+[[rules]]
+phrases = ["tab", "tab {n}"]
+action = "tab"
+
+[[rules]]
+phrases = ["space", "space {n}"]
+action = "space"
+
+# ─── window / app ─────────────────────────────────────────────────────────────
+[[rules]]
+phrases = ["go back", "back"]
+action = "go_back"
+
+[[rules]]
+phrases = ["go forward", "forward"]
+action = "go_forward"
+
+[[rules]]
+phrases = ["refresh", "reload", "reload page"]
+action = "refresh"
+
+[[rules]]
+phrases = ["new tab", "open a new tab"]
+action = "new_tab"
+
+[[rules]]
+phrases = ["close tab", "close window", "close this"]
+action = "close_tab"
+
+[[rules]]
+phrases = ["next tab", "next tab {n}"]
+action = "next_tab"
+
+[[rules]]
+phrases = ["previous tab", "last tab", "previous tab {n}"]
+action = "prev_tab"
+
+[[rules]]
+phrases = ["switch app", "switch apps", "next app"]
+action = "switch_app"
+
+# ─── pointer ──────────────────────────────────────────────────────────────────
+[[rules]]
+phrases = ["click", "left click", "tap"]
+action = "click"
+
+[[rules]]
+phrases = ["right click", "context menu"]
+action = "right_click"
+
+[[rules]]
+phrases = ["double click"]
+action = "double_click"
+
+[[rules]]
+phrases = ["scroll up", "scroll up {n}"]
+action = "scroll_up"
+
+[[rules]]
+phrases = ["scroll down", "scroll down {n}"]
+action = "scroll_down"
+
+# ─── ambiguous by design: ask, never guess (eyes-off, a wrong guess costs work) ──
+[[rules]]
+phrases = ["select", "select that"]
+clarify = "select what? (word, line, all)"
+
+[[rules]]
+phrases = ["delete that", "delete this"]
+clarify = "delete what? (character, word, line)"
+
+[[rules]]
+phrases = ["open", "launch", "start"]
+clarify = "open what? (browser, terminal, finder, code, …)"
+
+# ─── app launch ───────────────────────────────────────────────────────────────
+# Verb optional: bare "browser" resolves too. Apps with no sensible Linux argv are
+# mac-only here — on Linux the rule matches and reports "not available".
+[[rules]]
+phrases = ["browser", "open browser", "open the browser", "web browser", "internet", "safari", "open safari"]
+label = "open browser"
+launch_mac = ["open", "-a", "Safari"]
+launch_linux = ["xdg-open", "https://start.duckduckgo.com"]
+
+[[rules]]
+phrases = ["chrome", "open chrome", "google chrome"]
+label = "open chrome"
+launch_mac = ["open", "-a", "Google Chrome"]
+launch_linux = ["google-chrome-stable"]
+
+[[rules]]
+phrases = ["firefox", "open firefox"]
+label = "open firefox"
+launch_mac = ["open", "-a", "Firefox"]
+launch_linux = ["firefox"]
+
+[[rules]]
+phrases = ["terminal", "open terminal", "shell", "console", "iterm"]
+label = "open terminal"
+launch_mac = ["open", "-a", "Terminal"]
+launch_linux = ["x-terminal-emulator"]
+
+[[rules]]
+phrases = ["finder", "file manager", "files", "explorer", "open finder"]
+label = "open finder"
+launch_mac = ["open", "-a", "Finder"]
+launch_linux = ["xdg-open", "."]
+
+[[rules]]
+phrases = ["code", "editor", "vs code", "vscode", "code editor", "open code"]
+label = "open code"
+launch_mac = ["open", "-a", "Visual Studio Code"]
+launch_linux = ["code"]
+
+[[rules]]
+phrases = ["mail", "email", "open mail"]
+label = "open mail"
+launch_mac = ["open", "-a", "Mail"]
+launch_linux = ["xdg-open", "mailto:"]
+
+[[rules]]
+phrases = ["notes", "note", "open notes"]
+label = "open notes"
+launch_mac = ["open", "-a", "Notes"]
+
+[[rules]]
+phrases = ["music", "spotify", "itunes", "open music"]
+label = "open music"
+launch_mac = ["open", "-a", "Music"]
+launch_linux = ["spotify"]
+
+[[rules]]
+phrases = ["calendar", "agenda", "open calendar"]
+label = "open calendar"
+launch_mac = ["open", "-a", "Calendar"]
