@@ -1,4 +1,16 @@
-// remoat thin client: touchpad + device dropdown + push-to-talk.
+// remoat thin client: touchpad + arranged multi-device cursor + push-to-talk.
+//
+// Devices are arranged like monitors (see arrange.js) and the pointer is ONE cursor in that
+// shared space: shove it off an edge and it continues onto whichever device borders that
+// edge. That requires knowing where the cursor is, which nothing can ask Wayland — so this
+// client owns the position and sends absolute coordinates (`move_abs`) to the device the
+// cursor is currently on.
+//
+// Consequence: we keep a socket open to EVERY device, because a crossing has to be instant.
+import {
+  center, fitTransform, localOf, rectsFor, snapRect, stepPointer,
+} from "./arrange.js";
+
 (() => {
   "use strict";
 
@@ -6,71 +18,164 @@
   const BAR_SENS = 1.1;    // scroll-bar drag scaling
   const TAP_MS = 250;      // max duration for a tap
   const TAP_SLOP = 10;     // max movement (px) still counted as a tap
+  const TILE_TAP_SLOP = 8; // tile drag vs tap
+  const LAYOUT_KEY = "remoat.layout";
+  const ACTIVE_KEY = "remoat.active";
 
   const $ = (id) => document.getElementById(id);
-  const pad = $("pad"), statusDot = $("status"), deviceSel = $("device"), toast = $("toast");
+  const pad = $("pad"), statusDot = $("status"), toast = $("toast");
+  const devBtn = $("devbtn"), devName = $("devname"), panel = $("arrange"), stage = $("stage");
 
-  // ---- WebSocket ----
-  let ws = null, wantHost = null;
+  // ---- device pool ----
+  // id = the daemon's own name (stable across DHCP churn, unlike host:port).
+  const devices = new Map();   // id -> {id, name, platform, host, port, w, h, ws, status}
+  let layout = loadLayout();   // id -> {x, y} in the shared device-pixel space
+  let activeId = localStorage.getItem(ACTIVE_KEY) || null;
+  let originId = null;         // the daemon serving this page
+  let cursor = null;           // {id, gx, gy, overshoot}
 
-  function wsUrl(host) {
-    if (host) return `wss://${host}/ws`;
-    return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+  function loadLayout() {
+    try { return JSON.parse(localStorage.getItem(LAYOUT_KEY)) || {}; } catch (_) { return {}; }
+  }
+  function saveLayout() {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
   }
 
-  function connect(host) {
-    wantHost = host || null;
-    if (ws) { try { ws.close(); } catch (_) {} }
-    ws = new WebSocket(wsUrl(host));
-    ws.onopen = () => { statusDot.classList.add("on"); statusDot.title = "connected"; };
-    ws.onclose = () => { statusDot.classList.remove("on"); statusDot.title = "disconnected"; setTimeout(() => connect(wantHost), 1500); };
-    ws.onerror = () => showToast("connection error", "err");
+  const deviceList = () => [...devices.values()];
+  const rects = () => rectsFor(deviceList(), layout);
+  const rectOf = (id) => rects().find((r) => r.id === id);
+  const active = () => devices.get(activeId);
+
+  function isOrigin(d) {
+    const port = location.port || "443";
+    return d.host === location.hostname && String(d.port) === port;
+  }
+
+  function wsUrl(d) {
+    // Same-origin for the serving daemon: its certificate is already accepted, and reusing
+    // the origin avoids a second trust prompt for the same machine.
+    if (d.id === originId || isOrigin(d)) return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+    return `wss://${d.host}:${d.port}/ws`;
+  }
+
+  function setStatus(d, status) {
+    d.status = status;
+    if (d.id === activeId) {
+      statusDot.className = "dot" + (status === "connected" ? " on" : "");
+      statusDot.title = status;
+    }
+    render();
+  }
+
+  function connectDevice(d) {
+    if (d.ws && (d.ws.readyState === 0 || d.ws.readyState === 1)) return;
+    setStatus(d, "connecting");
+    let opened = false;
+    let ws;
+    try { ws = new WebSocket(wsUrl(d)); } catch (_) { setStatus(d, "untrusted"); return; }
+    d.ws = ws;
+
+    ws.onopen = () => {
+      opened = true;
+      setStatus(d, "connected");
+      send(d, { type: "hello" });
+      if (d.id === activeId) sendWake();
+    };
     ws.onmessage = (e) => {
       let m; try { m = JSON.parse(e.data); } catch (_) { return; }
-      if (m.type === "devices") mergeDevices(m.devices);
-      else if (m.type === "command_result") showToast(m.message || m.label, m.ok ? "ok" : "err");
+      onMessage(d, m);
+    };
+    ws.onerror = () => {};
+    ws.onclose = () => {
+      // Never opened => almost always an untrusted self-signed cert on that peer (the
+      // browser won't tell us why). Slow retry, and the tile offers a way to accept it.
+      setStatus(d, opened ? "offline" : "untrusted");
+      const delay = opened ? 1500 : 20000;
+      setTimeout(() => connectDevice(d), delay);
     };
   }
 
-  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
-
-  // ---- device dropdown ----
-  // Accumulate every device we've ever seen. Each daemon's `devices` message is only
-  // its own momentary mDNS view; rebuilding from it alone would drop peers whose mDNS
-  // record briefly lapsed. Merge instead so a device never vanishes mid-session.
-  const known = new Map();   // "host:port" -> {name, platform, host, port, val}
-  let currentVal = null;     // the daemon the WS is actually connected to
-
-  function mergeDevices(devices) {
-    if (!devices) return;
-    let connectedTo = null;
-    for (const d of devices) {
-      const val = `${d.host}:${d.port}`;
-      known.set(val, { name: d.name, platform: d.platform, host: d.host, port: d.port, val });
-      if (d.self) connectedTo = val;   // the reporting daemon = the one we're on
-    }
-    if (connectedTo) currentVal = connectedTo;
-    renderDevices();
+  function onMessage(d, m) {
+    if (m.type === "devices") mergeDevices(m.devices);
+    else if (m.type === "screen") {
+      // A device's own bounds — until this arrives we can't drive an absolute cursor on it.
+      // This frame also names the connection, which is how the bootstrap placeholder becomes
+      // a real device (and how a duplicate socket to the same daemon gets collapsed).
+      if (d.id !== m.name) {
+        const dup = devices.get(m.name);
+        if (dup && dup !== d && dup.ws) try { dup.ws.close(); } catch (_) {}
+        devices.delete(d.id);
+        if (activeId === d.id) activeId = m.name;
+        d.id = m.name;
+        devices.set(d.id, d);
+      }
+      d.name = m.name;
+      d.platform = m.platform || d.platform;
+      d.w = m.w; d.h = m.h;
+      if (!originId && isOrigin(d)) originId = d.id;
+      if (!activeId || !devices.has(activeId)) setActive(d.id, { quiet: true });
+      render();
+    } else if (m.type === "command_result") {
+      showToast(m.message || m.label, m.ok ? "ok" : "err");
+    } else if (m.type === "wake_state") onWakeState(m);
   }
 
-  function renderDevices() {
-    deviceSel.innerHTML = "";
-    for (const d of known.values()) {
-      const o = document.createElement("option");
-      o.value = d.val;
-      o.textContent = `${d.name} · ${d.platform}`;
-      deviceSel.appendChild(o);
+  // Accumulate every device we've ever seen: each daemon's `devices` frame is only its own
+  // momentary mDNS view, so rebuilding from one would drop peers whose record briefly lapsed.
+  function mergeDevices(list) {
+    if (!list) return;
+    let added = false;
+    for (const p of list) {
+      const id = p.name;
+      const known = devices.get(id);
+      if (known) {
+        known.host = p.host || known.host;
+        known.port = p.port || known.port;
+        known.platform = p.platform || known.platform;
+        continue;
+      }
+      devices.set(id, { id, name: p.name, platform: p.platform, host: p.host, port: p.port, w: 0, h: 0, status: "new" });
+      added = true;
     }
-    if (currentVal && known.has(currentVal)) deviceSel.value = currentVal;
+    if (added) {
+      for (const d of devices.values()) if (!d.ws) connectDevice(d);
+    }
+    render();
   }
 
-  deviceSel.addEventListener("change", () => {
-    const host = deviceSel.value;
-    currentVal = host;   // remember selection so a device-list refresh doesn't reset it
-    // Reconnect to selected daemon; the served origin reconnects same-origin.
-    connect(host === `${location.hostname}:${location.port || 443}` ? null : host);
-    showToast(`switched to ${deviceSel.selectedOptions[0].textContent}`);
-  });
+  function send(d, obj) {
+    if (d && d.ws && d.ws.readyState === 1) d.ws.send(JSON.stringify(obj));
+  }
+  const sendTo = (id, obj) => send(devices.get(id), obj);
+  const sendActive = (obj) => sendTo(activeId, obj);
+
+  function setActive(id, { quiet = false } = {}) {
+    if (!devices.has(id) || id === activeId) return;
+    const prev = activeId;
+    activeId = id;
+    localStorage.setItem(ACTIVE_KEY, id);
+    // The wake lock follows the cursor: the machine you're driving is the one that must not
+    // auto-lock, and the one you left should be allowed to.
+    if (prev) sendTo(prev, { type: "wake", on: false });
+    sendWake();
+    const d = devices.get(id);
+    setStatus(d, d.status || "connecting");
+    if (!quiet) showToast(`→ ${d.name}`);
+    placeCursor(id);
+    render();
+  }
+
+  /// Park the virtual cursor on a device (its middle, unless we're already there).
+  function placeCursor(id, at) {
+    const r = rectOf(id);
+    if (!r) return;
+    const p = at || center(r);
+    cursor = { id, gx: p.gx, gy: p.gy, overshoot: 0 };
+    if (r.known) {
+      const l = localOf(rects(), id, cursor.gx, cursor.gy);
+      sendTo(id, { type: "move_abs", x: l.x, y: l.y });
+    }
+  }
 
   // ---- toast ----
   let toastTimer = null;
@@ -81,19 +186,168 @@
     toastTimer = setTimeout(() => { toast.className = ""; }, 1800);
   }
 
+  // ---- arrangement panel ----
+  let dragging = null;   // {id, startX, startY, orig, moved}
+
+  devBtn.addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+    devBtn.classList.toggle("open", !panel.hidden);
+    if (!panel.hidden) render();
+  });
+
+  function render() {
+    const d = active();
+    devName.textContent = d ? d.name : "connecting…";
+    statusDot.className = "dot" + (d && d.status === "connected" ? " on" : "");
+    if (panel.hidden) return;
+
+    const rs = rects();
+    // Defaults become sticky once drawn, so a device doesn't hop about between sessions.
+    for (const r of rs) {
+      if (!layout[r.id]) layout[r.id] = { x: r.x, y: r.y };
+    }
+    const { scale, ox, oy } = fitTransform(rs, stage.clientWidth || 320, stage.clientHeight || 150, 12);
+    stage.innerHTML = "";
+    for (const r of rs) {
+      const d2 = devices.get(r.id);
+      const el = document.createElement("div");
+      el.className = "tile" + (r.id === activeId ? " active" : "") + (r.known ? "" : " unknown");
+      el.dataset.id = r.id;
+      el.style.left = `${r.x * scale + ox}px`;
+      el.style.top = `${r.y * scale + oy}px`;
+      el.style.width = `${r.w * scale}px`;
+      el.style.height = `${r.h * scale}px`;
+      el.innerHTML =
+        `<span class="tname">${d2 ? d2.name : r.id}</span>` +
+        `<span class="tres">${r.known ? `${r.w}×${r.h}` : statusText(d2)}</span>` +
+        `<span class="tdot ${d2 && d2.status === "connected" ? "on" : ""}"></span>`;
+      stage.appendChild(el);
+    }
+  }
+
+  function statusText(d) {
+    if (!d) return "?";
+    if (d.status === "untrusted") return "tap to trust";
+    if (d.status === "connected") return "…";
+    return d.status;
+  }
+
+  stage.addEventListener("pointerdown", (e) => {
+    const tile = e.target.closest(".tile");
+    if (!tile) return;
+    e.preventDefault();
+    tile.setPointerCapture(e.pointerId);
+    const id = tile.dataset.id;
+    const r = rectOf(id);
+    dragging = { id, startX: e.clientX, startY: e.clientY, orig: { x: r.x, y: r.y }, moved: false, el: tile };
+  });
+
+  stage.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - dragging.startX, dy = e.clientY - dragging.startY;
+    if (Math.abs(dx) > TILE_TAP_SLOP || Math.abs(dy) > TILE_TAP_SLOP) dragging.moved = true;
+    if (!dragging.moved) return;
+    const rs = rects();
+    const { scale } = fitTransform(rs, stage.clientWidth, stage.clientHeight, 12);
+    const me = rs.find((r) => r.id === dragging.id);
+    const moved = { ...me, x: dragging.orig.x + dx / scale, y: dragging.orig.y + dy / scale };
+    layout[dragging.id] = snapRect(moved, rs.filter((r) => r.id !== dragging.id));
+    render();
+  });
+
+  const endDrag = (e) => {
+    if (!dragging) return;
+    if (!dragging.moved) {
+      const d = devices.get(dragging.id);
+      // A never-opened peer is almost certainly an untrusted cert: send them to its page so
+      // the browser can offer the exception, which is the only way the WS will ever connect.
+      if (d && d.status === "untrusted") {
+        showToast(`accept ${d.name}'s certificate, then come back`);
+        window.open(`https://${d.host}:${d.port}/`, "_blank");
+      } else {
+        setActive(dragging.id);
+      }
+    } else {
+      saveLayout();
+      if (cursor && !rectOf(cursor.id)) placeCursor(activeId);
+      else if (cursor) cursor = { ...cursor, overshoot: 0 };
+    }
+    dragging = null;
+    render();
+  };
+  stage.addEventListener("pointerup", endDrag);
+  stage.addEventListener("pointercancel", endDrag);
+  window.addEventListener("resize", render);
+
+  // ---- wake lock (hold off the active desktop's auto-lock while this app is focused) ----
+  // The daemon holds an inhibitor for as long as we claim focus, and drops it if we go quiet
+  // for 90s — so the heartbeat is what keeps a focused app's lock alive, and a phone that
+  // dies or drops Wi-Fi gives the desktop its screen lock back on its own.
+  const WAKE_BEAT_MS = 30000;
+  let wakeWarned = false;
+
+  const appFocused = () =>
+    document.visibilityState === "visible" && document.hasFocus?.() !== false;
+
+  function sendWake() { sendActive({ type: "wake", on: appFocused() }); }
+
+  function onWakeState(m) {
+    if (m.held && m.available === false && !wakeWarned) {
+      wakeWarned = true;   // once per session; nagging every heartbeat is worse than useless
+      showToast("this device can't block auto-lock", "err");
+    }
+  }
+
+  document.addEventListener("visibilitychange", sendWake);
+  window.addEventListener("focus", sendWake);
+  window.addEventListener("blur", sendWake);
+  window.addEventListener("pagehide", () => sendActive({ type: "wake", on: false }));
+  setInterval(() => { if (appFocused()) sendWake(); }, WAKE_BEAT_MS);
+
   // ---- touchpad ----
   let lastX = 0, lastY = 0, startX = 0, startY = 0, startT = 0;
   let maxTouches = 0, moved = false, pendDx = 0, pendDy = 0, scrollAccX = 0, scrollAccY = 0, rafPending = false;
+  let blockedAt = 0;
 
   function flush() {
     rafPending = false;
-    if (pendDx || pendDy) { send({ type: "move", dx: pendDx, dy: pendDy }); pendDx = pendDy = 0; }
+    if (pendDx || pendDy) {
+      moveCursor(pendDx, pendDy);
+      pendDx = pendDy = 0;
+    }
     if (Math.abs(scrollAccX) >= 1 || Math.abs(scrollAccY) >= 1) {
-      send({ type: "scroll", dx: Math.round(scrollAccX), dy: Math.round(scrollAccY) });
+      sendActive({ type: "scroll", dx: Math.round(scrollAccX), dy: Math.round(scrollAccY) });
       scrollAccX = scrollAccY = 0;
     }
   }
   function schedule() { if (!rafPending) { rafPending = true; requestAnimationFrame(flush); } }
+
+  /// The whole point: integrate the touch delta into the shared space, hand over at edges.
+  function moveCursor(dx, dy) {
+    const rs = rects();
+    if (!cursor || !rs.some((r) => r.id === cursor.id)) placeCursor(activeId);
+    if (!cursor) return;
+
+    const next = stepPointer(cursor, dx, dy, rs);
+    cursor = { id: next.id, gx: next.gx, gy: next.gy, overshoot: next.overshoot };
+
+    if (next.blocked) {
+      const now = Date.now();
+      if (now - blockedAt > 3000) {   // don't spam while they keep shoving
+        blockedAt = now;
+        const d = devices.get(next.blockedId);
+        showToast(d && d.status === "untrusted"
+          ? `${d.name}: accept its certificate to cross`
+          : `${d ? d.name : "device"} not connected`, "err");
+      }
+    }
+    if (next.crossed && next.id !== activeId) setActive(next.id);
+
+    const r = rs.find((x) => x.id === cursor.id);
+    if (!r || !r.known) return;
+    const l = localOf(rs, cursor.id, cursor.gx, cursor.gy);
+    sendTo(cursor.id, { type: "move_abs", x: l.x, y: l.y });
+  }
 
   pad.addEventListener("touchstart", (e) => {
     e.preventDefault();
@@ -122,8 +376,7 @@
     if (e.touches.length > 0) return; // wait until all fingers up
     const quick = (e.timeStamp - startT) < TAP_MS;
     if (quick && !moved) {
-      if (maxTouches >= 2) send({ type: "click", button: "right" });
-      else send({ type: "click", button: "left" });
+      sendActive({ type: "click", button: maxTouches >= 2 ? "right" : "left" });
     }
     maxTouches = 0;
   }, { passive: false });
@@ -170,7 +423,7 @@
     const back = typed.length - i;   // chars the recognizer took back
     const add = full.slice(i);       // chars to append
     if (back === 0 && add === "") return;
-    send({ type: "text", text: add, backspace: back });
+    sendActive({ type: "text", text: add, backspace: back });
     typed = full;
   }
 
@@ -207,8 +460,8 @@
     btn.querySelector(".lbl").textContent = btn.dataset.label;
     const mode = recMode, text = transcript.trim();
     // dictation streamed everything already; add a trailing space so the next word isn't glued on
-    if (mode === "type" && typed) send({ type: "text", text: " ", backspace: 0 });
-    if (mode === "command" && text) send({ type: "command", text });
+    if (mode === "type" && typed) sendActive({ type: "text", text: " ", backspace: 0 });
+    if (mode === "command" && text) sendActive({ type: "command", text });
     rec = null; recMode = null; transcript = ""; typed = "";
   }
 
@@ -218,5 +471,12 @@
   initPTT(typeBtn, "type");
   initPTT(cmdBtn, "command");
 
-  connect(null);
+  // Bootstrap: the serving daemon. It reports itself plus every peer it can see over mDNS,
+  // and each of those gets its own socket from mergeDevices().
+  devices.set("__origin__", {
+    id: "__origin__", name: "connecting…", platform: "?",
+    host: location.hostname, port: Number(location.port || 443), w: 0, h: 0, status: "new",
+  });
+  connectDevice(devices.get("__origin__"));
+  render();
 })();

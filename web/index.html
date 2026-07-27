@@ -13,9 +13,14 @@
 <body>
   <header>
     <div class="brand">remoat</div>
-    <select id="device"><option>connecting…</option></select>
+    <button id="devbtn" aria-label="devices"><span id="devname">connecting…</span><span class="chev">⌄</span></button>
     <span id="status" class="dot" title="disconnected"></span>
   </header>
+
+  <section id="arrange" hidden aria-label="device arrangement">
+    <div id="stage"></div>
+    <p class="arrange-hint">drag to arrange · tap to switch · push the cursor off an edge to cross</p>
+  </section>
 
   <div id="padwrap">
     <main id="pad" aria-label="touchpad">
@@ -38,6 +43,6 @@
     </button>
   </footer>
 
-  <script src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

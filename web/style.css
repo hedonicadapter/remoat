@@ -30,14 +30,41 @@ header {
   background: var(--panel);
 }
 .brand { font-weight: 700; letter-spacing: .5px; color: var(--accent); }
-#device {
-  flex: 1; min-width: 0;
-  background: var(--pad); color: var(--fg);
-  border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 10px; font-size: 14px; appearance: none;
+#devbtn {
+  flex: 1; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  background: var(--pad); color: var(--fg); font: inherit; font-size: 14px;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
 }
+#devbtn.open { border-color: var(--accent); }
+#devname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#devbtn .chev { color: var(--muted); }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err); flex: none; transition: background .2s; }
 .dot.on { background: var(--ok); }
+
+/* device arrangement — tiles laid out like a monitor-arrangement pane */
+#arrange {
+  border-bottom: 1px solid var(--line); background: var(--panel);
+  padding: 10px 16px 12px;
+}
+#stage {
+  position: relative; height: 150px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+  overflow: hidden; touch-action: none;
+}
+.tile {
+  position: absolute; overflow: hidden;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  background: var(--pad); border: 1px solid var(--line); border-radius: 6px;
+  font-size: 11px; line-height: 1.2; text-align: center; padding: 2px;
+  transition: border-color .12s, background .12s;
+}
+.tile.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, var(--pad)); }
+.tile.unknown { border-style: dashed; color: var(--muted); }
+.tile .tname { font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile .tres { color: var(--muted); font-size: 10px; }
+.tile .tdot { position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--err); }
+.tile .tdot.on { background: var(--ok); }
+.arrange-hint { margin: 8px 0 0; color: var(--muted); font-size: 11px; text-align: center; }
 
 /* touchpad + dedicated scroll bars: pad top-left, vbar right, hbar bottom */
 #padwrap {
