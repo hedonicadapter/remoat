@@ -156,25 +156,77 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
     }
 }
 
-fn parse_args() -> (String, u16) {
+enum Mode {
+    Serve,
+    /// Resolve a phrase and print what it would do — no injection. For checking commands.toml
+    /// edits without speaking into a live machine.
+    Check(String),
+    /// List the action allowlist (the names a commands.toml rule may reference).
+    Actions,
+}
+
+fn parse_args() -> (String, u16, Mode) {
     let mut host = "0.0.0.0".to_string();
     let mut port: u16 = 8443;
+    let mut mode = Mode::Serve;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--host" => { if let Some(v) = args.get(i + 1) { host = v.clone(); i += 1; } }
             "--port" => { if let Some(v) = args.get(i + 1) { port = v.parse().unwrap_or(8443); i += 1; } }
+            "--check" => { if let Some(v) = args.get(i + 1) { mode = Mode::Check(v.clone()); i += 1; } }
+            "--actions" => mode = Mode::Actions,
             _ => {}
         }
         i += 1;
     }
-    (host, port)
+    (host, port, mode)
+}
+
+fn print_actions() {
+    println!("action                platform mapping");
+    for name in actions::NAMES {
+        let (_, cmds) = actions::action(name).unwrap();
+        let map: Vec<String> = cmds
+            .iter()
+            .map(|c| match c {
+                InputCmd::Hotkey(ks) => ks.join("+"),
+                InputCmd::Key(k) => k.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        println!("{name:<21} {}", map.join(", "));
+    }
+    if let Some(p) = config::user_path() {
+        println!("\nuser table: {}", p.display());
+    }
+}
+
+fn check(phrase: &str) {
+    let res = commands::route(phrase);
+    println!("{phrase:?} -> {}", if res.matched { res.label.as_str() } else { "(unmatched)" });
+    match &res.message {
+        Some(m) if *m != res.label => println!("  {m}"),
+        _ => {}
+    }
+    for step in &res.steps {
+        match step {
+            Exec::Input(c) => println!("  input   {c:?}"),
+            Exec::Launch(a) => println!("  launch  {}", a.join(" ")),
+            Exec::Note(n) => println!("  note    {n}"),
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let (host, port) = parse_args();
+    let (host, port, mode) = parse_args();
+    match mode {
+        Mode::Actions => return print_actions(),
+        Mode::Check(p) => return check(&p),
+        Mode::Serve => {}
+    }
     let ip = tls::lan_ip();
     let name = gethostname::gethostname().to_string_lossy().split('.').next().unwrap_or("remoat").to_string();
 
