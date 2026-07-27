@@ -112,6 +112,11 @@ fn enigo_key(n: &str) -> Option<Key> {
         "tab" => Key::Tab,
         "space" => Key::Space,
         "backspace" => Key::Backspace,
+        "delete" => Key::Delete,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" | "page_up" => Key::PageUp,
+        "pagedown" | "page_down" => Key::PageDown,
         s if s.chars().count() == 1 => Key::Unicode(s.chars().next().unwrap()),
         _ => return None,
     })
@@ -154,11 +159,33 @@ fn kc(n: &str) -> Option<i32> {
         "alt" => 56,
         "shift" => 42,
         "super" | "command" | "meta" => 125,
-        "a" => 30, "c" => 46, "v" => 47, "x" => 45, "z" => 44,
+        // Full letter row set — command-table rules bind arbitrary chords (mod+s, mod+t, …).
+        "a" => 30, "b" => 48, "c" => 46, "d" => 32, "e" => 18, "f" => 33, "g" => 34,
+        "h" => 35, "i" => 23, "j" => 36, "k" => 37, "l" => 38, "m" => 50, "n" => 49,
+        "o" => 24, "p" => 25, "q" => 16, "r" => 19, "s" => 31, "t" => 20, "u" => 22,
+        "v" => 47, "w" => 17, "x" => 45, "y" => 21, "z" => 44,
+        "1" => 2, "2" => 3, "3" => 4, "4" => 5, "5" => 6,
+        "6" => 7, "7" => 8, "8" => 9, "9" => 10, "0" => 11,
+        "minus" => 12, "equal" => 13, "comma" => 51, "dot" => 52, "slash" => 53,
         "left" => 105, "right" => 106, "up" => 103, "down" => 108,
+        "home" => 102, "end" => 107, "pageup" | "page_up" => 104, "pagedown" | "page_down" => 109,
+        "insert" => 110, "delete" => 111,
         "enter" | "return" => 28, "esc" | "escape" => 1, "tab" => 15, "space" => 57, "backspace" => 14,
         _ => return None,
     })
+}
+
+/// Is this key name mappable on the running platform? Config validation gate — a rule with
+/// an unknown key is skipped at load instead of silently no-op'ing mid-command.
+pub fn key_known(name: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        enigo_key(name).is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        kc(name).is_some()
+    }
 }
 
 struct YdotoolBackend {
@@ -247,4 +274,18 @@ impl Backend for NullBackend {
     fn text(&mut self, _: &str) {}
     fn hotkey(&mut self, _: &[String]) {}
     fn key(&mut self, _: &str) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ydotool_knows_the_keys_the_command_table_uses() {
+        // Regression guard: the voice table binds mod+<letter> chords and home/end/page keys,
+        // all of which were missing from kc() before the command table existed.
+        for k in ["s", "t", "w", "r", "f", "home", "end", "pageup", "pagedown", "delete"] {
+            assert!(kc(k).is_some(), "ydotool keycode missing for {k:?}");
+        }
+    }
 }
