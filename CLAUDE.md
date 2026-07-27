@@ -58,7 +58,54 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
 - Wire the LLM/MCP command fallback (`src/commands.rs:llm_fallback`).
 - Move STT onto the daemon (whisper.cpp) — drop an audio→text step before the WS handler.
 - Confirm the Linux/Hyprland Rust build on the nixos box (unbuilt on the dev Mac).
-- ydotool `scroll` uses `mousemove --wheel` — least version-stable call; may need a tweak.
+- Build out voice editing commands + make them user-configurable — design below.
+
+## Planned: voice commands + configurable command table (design, not built)
+
+Goal: voice editing commands (backspace, delete-word, select-all, copy, undo, nav, …)
+in the deterministic tier, plus a user-editable command table — all funnelling into one
+bounded action surface the future LLM fallback also targets.
+
+**Layering (one bounded core, three front-ends):**
+```
+voice text → normalize → grammar parse → [(action, count), …] → action(name) → InputCmd
+                             └─ no match ─→ llm_fallback (emits the SAME (action,count) calls)
+buttons (if ever) send `action` directly; nothing bypasses the allowlist.
+```
+- Add `pub fn action(name) -> Option<(String, InputCmd)>` in `commands.rs`: the single
+  platform-mapped allowlist (delete_word = ⌥⌫ mac / ctrl+⌫ linux, copy = mod-chord, etc.).
+  `route()`'s existing regex verbs fold into it; `llm_fallback`'s tool schema becomes
+  `enum: [action names]`, so the LLM can't emit anything the deterministic tier can't.
+- `Action::Sequence(Vec<InputCmd>)` so a command expands to N repeats / chains; the
+  `command` arm in `main.rs` dispatches the sequence and sends ONE aggregated
+  `command_result`.
+
+**Voice-specific parser needs:**
+- Normalize first: lowercase, strip `.,?!`, collapse spaces, canonicalize mishearings
+  (`back space`→`backspace`), number-words→digits.
+- Counts are the win over buttons: `delete three words`, `up five`, `backspace twice`
+  → `{n}` repeat. Parse one..twenty, a/an→1, a couple→2, once/twice.
+- Chain on ` and `/` then `/`,` → sequence.
+- Eyes-off: `command_result` toast MUST echo the canonical intent (`delete word ×3`), and
+  unmatched must say so. Ambiguity rules: bare "delete" = one char; "select" alone = toast
+  "select what?", never guess.
+- Backend gap: `home`/`end` not yet in `enigo_key`/`kc()` (add enigo `Key::Home/End`,
+  ydotool `102`/`107`); `delete_line` linux path needs a combo. Rest of the table maps today.
+
+**Configurable command table:** built-in table IS just the default config, same schema.
+- `$XDG_CONFIG_HOME/remoat/commands.toml`; embedded default loaded first, user file merged
+  on top. User rules match BEFORE built-ins (so a rule can override a default), then LLM.
+- Rule = `phrases = [...]` (aliases + `{n}`) → one of a CLOSED set of action kinds:
+  `action` (registry ref, stays platform-mapped) | `keys`/`keys_mac`/`keys_linux` (raw
+  chord) | `text` (literal) | `launch` (argv) | `sequence` (compose the above).
+  Deliberately NO `shell = "…"` — config composes primitives, can't invent a shell escape,
+  preserving the bounded surface even for user rules (matters once auth lands).
+- Re-read TOML on each command (mtime check, tiny file) = edit + save + speak, no restart.
+- Fail soft: validate each rule's action/keys on load; unknown rule logged + skipped, rest
+  still load — a bad line never bricks the daemon.
+- `regex = true` per-rule as an opt-in for power users; default matcher stays alias+`{n}`.
+- Later: a PWA settings screen edits the same TOML over WS (`{type:"config_set",…}`); the
+  LLM can propose a rule that writes the same file. All roads → one config.
 
 ## Gotchas (hard-won — don't rediscover)
 
