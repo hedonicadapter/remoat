@@ -143,8 +143,57 @@ REMOAT_BACKEND=ydotool REMOAT_DRYRUN=1 ./run.sh   # logs `ydotool …` argv inst
 ## Voice
 - **Hold to type** → dictation typed into the focused field (via clipboard paste, so
   unicode/punctuation survive).
-- **Hold to command** → e.g. "open browser", "scroll down", "go back", "copy".
-  See `daemon/commands.py` for the full table.
+- **Hold to command** → editing and navigation by voice: "delete three words",
+  "select all then copy", "up five", "backspace twice", "go back", "open browser".
+  The toast echoes what was understood ("delete word ×3"), so you don't have to look.
+
+Counts are the reason voice beats buttons. Any command takes a count, either in the phrase
+("delete 3 words", "up five") or as a suffix ("backspace twice", "paste 3 times", "up x4").
+Chain steps with "and" / "then" / a comma — if any step isn't understood, nothing runs.
+Ambiguous phrases ask instead of guessing: "select" answers "select what? (word, line, all)".
+
+Check what a phrase resolves to without speaking, and list the available actions:
+
+```bash
+remoat --check "delete 3 words"    # prints the resolution; injects nothing
+remoat --actions                   # every action name + how it maps on this platform
+```
+
+## Custom commands (`commands.toml`)
+Put your own rules in `$XDG_CONFIG_HOME/remoat/commands.toml` (usually
+`~/.config/remoat/commands.toml`; `REMOAT_CONFIG=/path` overrides). Your rules are matched
+**before** the built-ins, so reusing a built-in phrase overrides it. The file is re-read
+whenever it changes — edit, save, speak, no restart.
+
+```toml
+[[rules]]
+phrases = ["wipe line", "wipe {n} lines"]   # aliases; {n} captures a count
+label = "wipe line"                         # optional: what the toast says
+sequence = [{ action = "select_line" }, { action = "backspace" }]
+
+[[rules]]
+phrases = ["sign off"]
+label = "sign off"
+sequence = [{ text = "Cheers," }, { action = "enter" }, { text = "Sam" }]
+
+[[rules]]
+phrases = ["screenshot"]
+launch_mac = ["screencapture", "-i", "-c"]  # argv, not a shell line
+launch_linux = ["grim", "-g", "-"]
+
+[[rules]]
+phrases = ["zoom in", "zoom in {n}"]
+keys_mac = ["command", "="]                 # raw chord; keys = [...] for both platforms
+keys_linux = ["ctrl", "="]
+```
+
+One rule = phrases plus exactly one of: `action` (a name from `remoat --actions`),
+`keys` / `keys_mac` / `keys_linux`, `text`, `launch` / `launch_mac` / `launch_linux`,
+`sequence` (a list of the previous kinds), or `clarify = "…"` (matches, asks, does nothing).
+Add `regex = true` to treat the phrases as regexes. There is deliberately **no** `shell`
+kind: rules compose the same bounded primitives the built-ins use, so a config file can't
+widen what the daemon is able to do. Invalid rules are logged and skipped — the rest of the
+file still loads. `src/commands.default.toml` is the built-in table; it's the best example.
 
 ## Known POC limits / next steps
 - **Wayland input injection**: handled via a `ydotool` backend (see Linux run
@@ -160,9 +209,13 @@ REMOAT_BACKEND=ydotool REMOAT_DRYRUN=1 ./run.sh   # logs `ydotool …` argv inst
 ## Layout
 ```
 src/             Rust daemon (the one the flake builds)
-  main.rs        axum: static PWA + /ws + HTTPS wiring
+  main.rs        axum: static PWA + /ws + HTTPS wiring; --check / --actions
   input.rs       backends: enigo (macOS) + ydotool (Linux) + null; worker thread
-  commands.rs    intent router + bounded action allowlist + LLM seam
+  commands.rs    intent router: command table → steps, + LLM seam
+  actions.rs     the bounded action allowlist (platform-mapped chords)
+  voice.rs       speech normalization, counts, chain splitting
+  config.rs      command table: embedded default + user commands.toml (hot-reloaded)
+  commands.default.toml   built-in command table = the default config
   discovery.rs   mdns-sd advertise/browse
   tls.rs         self-signed cert (rcgen) in $XDG_STATE_HOME
 web/             the PWA (index.html, app.js, style.css, manifest.json)
