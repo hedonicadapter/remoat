@@ -4,10 +4,13 @@
 //!   client -> server: {type:"hello"|"move"|"click"|"scroll"|"text"|"command"|"ping", ...}
 //!   server -> client: {type:"devices"|"command_result"|"pong", ...}
 
+mod actions;
 mod commands;
+mod config;
 mod discovery;
 mod input;
 mod tls;
+mod voice;
 
 use std::net::SocketAddr;
 
@@ -23,7 +26,7 @@ use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use tower_http::services::ServeDir;
 
-use commands::Action;
+use commands::Exec;
 use discovery::Discovery;
 use input::InputCmd;
 use std::sync::Arc;
@@ -96,20 +99,45 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
             "command" => {
                 let t = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
                 let res = commands::route(t);
-                let (kind, ok, message) = match res.action {
-                    Action::Input(cmd) => {
-                        let _ = st.tx.send(cmd);
-                        ("input", true, format!("did: {}", res.label))
+
+                // A resolution can expand to many steps (counts, chains). Dispatch them in
+                // order on the one ordered channel, then report ONE aggregated result — the
+                // toast is the eyes-off feedback, so it echoes the canonical intent.
+                let mut inputs = 0usize;
+                let mut launches = 0usize;
+                let mut errors: Vec<String> = Vec::new();
+                for step in res.steps {
+                    match step {
+                        Exec::Input(cmd) => {
+                            let _ = st.tx.send(cmd);
+                            inputs += 1;
+                        }
+                        Exec::Launch(argv) => match commands::execute_launch(&argv) {
+                            Ok(_) => launches += 1,
+                            Err(e) => errors.push(e),
+                        },
+                        Exec::Note(n) => errors.push(n),
                     }
-                    Action::Launch(argv) => {
-                        let m = commands::execute_launch(&argv);
-                        (("launch"), res.matched && !m.contains("fail"), m)
-                    }
-                    Action::None(msg) => ("none", false, msg),
+                }
+                let kind = match (inputs, launches) {
+                    (0, 0) => "none",
+                    (_, 0) => "input",
+                    (0, _) => "launch",
+                    _ => "mixed",
+                };
+                let acted = inputs + launches > 0;
+                let ok = res.matched && acted && errors.is_empty();
+                let message = if ok {
+                    res.label.clone()
+                } else if !errors.is_empty() {
+                    errors.join("; ")
+                } else {
+                    res.message.clone().unwrap_or_else(|| "nothing to do".into())
                 };
                 let _ = socket
                     .send(Message::Text(
-                        json!({"type":"command_result","ok":ok,"label":res.label,"kind":kind,"message":message})
+                        json!({"type":"command_result","ok":ok,"label":res.label,"kind":kind,
+                               "steps":inputs + launches,"message":message})
                             .to_string(),
                     ))
                     .await;
