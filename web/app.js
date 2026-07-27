@@ -162,12 +162,25 @@
       ev.preventDefault();
       if (rec) return;
       transcript = ""; recMode = mode;
+      let sentFinal = 0;   // dictation: how many final results already typed
       rec = new SR();
-      rec.lang = "en-US"; rec.interimResults = true; rec.continuous = false;
+      rec.lang = "en-US"; rec.interimResults = true;
+      rec.continuous = (mode === "type");   // dictation streams; command is one utterance
       rec.onresult = (e) => {
-        transcript = "";
-        for (let i = 0; i < e.results.length; i++) transcript += e.results[i][0].transcript;
-        btn.querySelector(".lbl").textContent = transcript || "listening…";
+        let interim = "";
+        for (let i = 0; i < e.results.length; i++) {
+          const r = e.results[i];
+          if (!r.isFinal) { interim += r[0].transcript; continue; }
+          if (mode === "type") {
+            if (i >= sentFinal) {                       // new finalized phrase -> type it now
+              send({ type: "text", text: r[0].transcript.trim() + " " });
+              sentFinal = i + 1;
+            }
+          } else {
+            transcript += r[0].transcript + " ";        // command: accumulate, send on release
+          }
+        }
+        btn.querySelector(".lbl").textContent = interim || (mode === "type" ? "dictating…" : "listening…");
       };
       rec.onerror = (e) => showToast("mic: " + e.error, "err");
       rec.onend = () => finish(btn);
@@ -182,13 +195,12 @@
   }
 
   function finish(btn) {
-    const text = transcript.trim();
     btn.classList.remove("rec");
     btn.querySelector(".lbl").textContent = btn.dataset.label;
-    const mode = recMode; rec = null; recMode = null;
-    if (!text) return;
-    if (mode === "type") { send({ type: "text", text }); showToast('typed: "' + text + '"'); }
-    else { send({ type: "command", text }); }
+    const mode = recMode, text = transcript.trim();
+    rec = null; recMode = null; transcript = "";
+    // dictation already streamed its finalized phrases; only command sends here
+    if (mode === "command" && text) send({ type: "command", text });
   }
 
   const typeBtn = $("ptt-type"), cmdBtn = $("ptt-cmd");
