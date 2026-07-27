@@ -154,33 +154,41 @@
 
   // ---- push-to-talk (Web Speech API) ----
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let rec = null, recMode = null, transcript = "";
+  let rec = null, recMode = null, transcript = "", typed = "";
+
+  // Collapse whitespace so the running transcript diffs cleanly (target field owns spacing).
+  const norm = (s) => s.trim().replace(/\s+/g, " ");
+
+  // Live dictation: keep the target field equal to `full` after each partial result.
+  // Web Speech rewrites in-flight words, so delete the tail it revised, then type the
+  // new tail — that's why the daemon takes a `backspace` count alongside the text.
+  function streamText(full) {
+    full = norm(full);
+    let i = 0;
+    const n = Math.min(typed.length, full.length);
+    while (i < n && typed[i] === full[i]) i++;
+    const back = typed.length - i;   // chars the recognizer took back
+    const add = full.slice(i);       // chars to append
+    if (back === 0 && add === "") return;
+    send({ type: "text", text: add, backspace: back });
+    typed = full;
+  }
 
   function initPTT(btn, mode) {
     if (!SR) { btn.disabled = true; btn.querySelector(".sub").textContent = "voice unsupported"; return; }
     const start = (ev) => {
       ev.preventDefault();
       if (rec) return;
-      transcript = ""; recMode = mode;
-      let sentFinal = 0;   // dictation: how many final results already typed
+      transcript = ""; typed = ""; recMode = mode;
       rec = new SR();
       rec.lang = "en-US"; rec.interimResults = true;
       rec.continuous = (mode === "type");   // dictation streams; command is one utterance
       rec.onresult = (e) => {
-        let interim = "";
-        for (let i = 0; i < e.results.length; i++) {
-          const r = e.results[i];
-          if (!r.isFinal) { interim += r[0].transcript; continue; }
-          if (mode === "type") {
-            if (i >= sentFinal) {                       // new finalized phrase -> type it now
-              send({ type: "text", text: r[0].transcript.trim() + " " });
-              sentFinal = i + 1;
-            }
-          } else {
-            transcript += r[0].transcript + " ";        // command: accumulate, send on release
-          }
-        }
-        btn.querySelector(".lbl").textContent = interim || (mode === "type" ? "dictating…" : "listening…");
+        let full = "";                       // whole running transcript (final + interim)
+        for (let i = 0; i < e.results.length; i++) full += e.results[i][0].transcript;
+        if (mode === "type") streamText(full);   // type interim words live, fix as they settle
+        else transcript = full;                  // command: hold until release
+        btn.querySelector(".lbl").textContent = norm(full) || (mode === "type" ? "dictating…" : "listening…");
       };
       rec.onerror = (e) => showToast("mic: " + e.error, "err");
       rec.onend = () => finish(btn);
@@ -198,9 +206,10 @@
     btn.classList.remove("rec");
     btn.querySelector(".lbl").textContent = btn.dataset.label;
     const mode = recMode, text = transcript.trim();
-    rec = null; recMode = null; transcript = "";
-    // dictation already streamed its finalized phrases; only command sends here
+    // dictation streamed everything already; add a trailing space so the next word isn't glued on
+    if (mode === "type" && typed) send({ type: "text", text: " ", backspace: 0 });
     if (mode === "command" && text) send({ type: "command", text });
+    rec = null; recMode = null; transcript = ""; typed = "";
   }
 
   const typeBtn = $("ptt-type"), cmdBtn = $("ptt-cmd");

@@ -80,8 +80,17 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                 let _ = st.tx.send(InputCmd::Scroll { dx, dy });
             }
             "text" => {
+                // Live dictation streams a running transcript: delete `backspace` chars
+                // the recognizer revised, then type the new tail. Order matters — enqueue
+                // deletes before the insert on the same ordered channel.
+                let back = v.get("backspace").and_then(|x| x.as_u64()).unwrap_or(0);
+                for _ in 0..back {
+                    let _ = st.tx.send(InputCmd::Key("backspace".into()));
+                }
                 if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                    let _ = st.tx.send(InputCmd::Text(t.to_string()));
+                    if !t.is_empty() {
+                        let _ = st.tx.send(InputCmd::Text(t.to_string()));
+                    }
                 }
             }
             "command" => {
