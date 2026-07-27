@@ -201,13 +201,23 @@ impl YdotoolBackend {
         let _ = Command::new("ydotool").args(args).status();
     }
     fn keyseq(&self, names: &[String]) {
-        let codes: Vec<i32> = names.iter().filter_map(|n| kc(n)).collect();
-        if codes.is_empty() { return; }
-        let mut args = vec!["key".to_string()];
-        for c in &codes { args.push(format!("{c}:1")); }
-        for c in codes.iter().rev() { args.push(format!("{c}:0")); }
-        self.run(&args);
+        if let Some(args) = keyargs(names) {
+            self.run(&args);
+        }
     }
+}
+
+/// `["ctrl","home"]` -> `key 29:1 102:1 102:0 29:1`. Press in order, release in reverse.
+/// Split out from the call so the chord wiring is testable without a uinput device.
+fn keyargs(names: &[String]) -> Option<Vec<String>> {
+    let codes: Vec<i32> = names.iter().filter_map(|n| kc(n)).collect();
+    if codes.is_empty() {
+        return None;
+    }
+    let mut args = vec!["key".to_string()];
+    for c in &codes { args.push(format!("{c}:1")); }
+    for c in codes.iter().rev() { args.push(format!("{c}:0")); }
+    Some(args)
 }
 
 impl Backend for YdotoolBackend {
@@ -280,6 +290,18 @@ impl Backend for NullBackend {
 mod tests {
     use super::*;
 
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn ydotool_chord_presses_then_releases_in_reverse() {
+        assert_eq!(
+            keyargs(&names(&["ctrl", "home"])).unwrap(),
+            names(&["key", "29:1", "102:1", "102:0", "29:0"])
+        );
+    }
+
     #[test]
     fn ydotool_knows_the_keys_the_command_table_uses() {
         // Regression guard: the voice table binds mod+<letter> chords and home/end/page keys,
@@ -287,5 +309,10 @@ mod tests {
         for k in ["s", "t", "w", "r", "f", "home", "end", "pageup", "pagedown", "delete"] {
             assert!(kc(k).is_some(), "ydotool keycode missing for {k:?}");
         }
+    }
+
+    #[test]
+    fn unknown_key_yields_no_argv() {
+        assert!(keyargs(&names(&["hyperkey"])).is_none());
     }
 }
