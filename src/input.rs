@@ -13,6 +13,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 #[derive(Debug, Clone)]
 pub enum InputCmd {
     Move { dx: f64, dy: f64 },
+    /// Absolute placement. The phone owns the cursor position when devices are arranged, so
+    /// edge crossing can warp the pointer to the exact entry point on the next device.
+    MoveAbs { x: i32, y: i32 },
     Click { button: String, double: bool },
     Scroll { dx: f64, dy: f64 },
     Text(String),
@@ -23,6 +26,7 @@ pub enum InputCmd {
 pub trait Backend {
     fn name(&self) -> &'static str;
     fn move_rel(&mut self, dx: f64, dy: f64);
+    fn move_abs(&mut self, x: i32, y: i32);
     fn click(&mut self, button: &str, double: bool);
     fn scroll(&mut self, dx: f64, dy: f64);
     fn text(&mut self, s: &str);
@@ -32,6 +36,7 @@ pub trait Backend {
     fn apply(&mut self, cmd: InputCmd) {
         match cmd {
             InputCmd::Move { dx, dy } => self.move_rel(dx, dy),
+            InputCmd::MoveAbs { x, y } => self.move_abs(x, y),
             InputCmd::Click { button, double } => self.click(&button, double),
             InputCmd::Scroll { dx, dy } => self.scroll(dx, dy),
             InputCmd::Text(s) => self.text(&s),
@@ -128,6 +133,9 @@ impl Backend for EnigoBackend {
     fn move_rel(&mut self, dx: f64, dy: f64) {
         let _ = self.enigo.move_mouse(dx.round() as i32, dy.round() as i32, Coordinate::Rel);
     }
+    fn move_abs(&mut self, x: i32, y: i32) {
+        let _ = self.enigo.move_mouse(x, y, Coordinate::Abs);
+    }
     fn click(&mut self, button: &str, double: bool) {
         let b = match button { "right" => Button::Right, "middle" => Button::Middle, _ => Button::Left };
         let _ = self.enigo.button(b, Direction::Click);
@@ -207,6 +215,12 @@ impl YdotoolBackend {
     }
 }
 
+/// Absolute move: `-a` switches mousemove from relative to absolute. Both axes are required
+/// (same quirk as the wheel — omitting one makes ydotool dump usage instead of moving).
+fn absargs(x: i32, y: i32) -> Vec<String> {
+    vec!["mousemove".into(), "-a".into(), "-x".into(), x.to_string(), "-y".into(), y.to_string()]
+}
+
 /// `["ctrl","home"]` -> `key 29:1 102:1 102:0 29:1`. Press in order, release in reverse.
 /// Split out from the call so the chord wiring is testable without a uinput device.
 fn keyargs(names: &[String]) -> Option<Vec<String>> {
@@ -225,6 +239,9 @@ impl Backend for YdotoolBackend {
     fn move_rel(&mut self, dx: f64, dy: f64) {
         self.run(&["mousemove".into(), "-x".into(), (dx.round() as i32).to_string(),
                    "-y".into(), (dy.round() as i32).to_string()]);
+    }
+    fn move_abs(&mut self, x: i32, y: i32) {
+        self.run(&absargs(x, y));
     }
     fn click(&mut self, button: &str, double: bool) {
         let code = match button { "right" => "0xC1", "middle" => "0xC2", _ => "0xC0" };
@@ -279,6 +296,7 @@ impl NullBackend {
 impl Backend for NullBackend {
     fn name(&self) -> &'static str { "null" }
     fn move_rel(&mut self, _: f64, _: f64) {}
+    fn move_abs(&mut self, _: i32, _: i32) {}
     fn click(&mut self, _: &str, _: bool) {}
     fn scroll(&mut self, _: f64, _: f64) {}
     fn text(&mut self, _: &str) {}
@@ -314,5 +332,10 @@ mod tests {
     #[test]
     fn unknown_key_yields_no_argv() {
         assert!(keyargs(&names(&["hyperkey"])).is_none());
+    }
+
+    #[test]
+    fn ydotool_absolute_move_passes_both_axes() {
+        assert_eq!(absargs(1919, 0), names(&["mousemove", "-a", "-x", "1919", "-y", "0"]));
     }
 }
