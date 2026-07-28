@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  DEFAULT_W, PUSH, center, entryPoint, fitTransform, inside, localOf, neighbor,
+  DEFAULT_W, PUSH, advance, center, entryPoint, fitTransform, inside, localOf, neighbor,
   placeNew, rectsFor, snapRect, stepPointer,
 } from "./arrange.js";
 
@@ -162,6 +162,40 @@ test("fitTransform maps the whole arrangement into the panel", () => {
     assert.ok(p.t >= 9.9 && p.b <= 140.1, `y within panel: ${p.t}..${p.b}`);
   }
   assert.ok(scale > 0 && scale < 1);
+});
+
+test("advance sends the pointer to the device it's on", () => {
+  const rects = side();
+  const a = advance({ id: "mac", gx: 900, gy: 500, overshoot: 0 }, 10, 5, rects);
+  assert.deepEqual(a.send, { id: "mac", x: 910, y: 505, home: false });
+  assert.equal(a.crossed, false);
+});
+
+test("advance lands a crossing on the entry edge of the new device, and homes", () => {
+  // Regression guard: the landing point must survive to the wire. An earlier version
+  // re-centred the pointer when the active device changed, so crossings arrived mid-screen.
+  const rects = side();
+  let s = { id: "mac", gx: 1700, gy: 640, overshoot: 0 };
+  let a;
+  for (let i = 0; i < 8; i++) {
+    a = advance(s, 30, 0, rects);
+    s = a.state;
+    if (a.crossed) break;
+  }
+  assert.equal(a.crossed, true);
+  assert.deepEqual(a.send, { id: "nixos", x: 0, y: 640, home: true },
+    "enters at the neighbour's left edge, same height, asking the daemon to re-home");
+});
+
+test("advance sends nothing to a device whose bounds are unknown", () => {
+  const rects = rectsFor([mac, { id: "ghost", w: 0, h: 0 }], {
+    mac: { x: 0, y: 0 }, ghost: { x: 1800, y: 0 },
+  });
+  let s = { id: "mac", gx: 1700, gy: 500, overshoot: 0 };
+  let a;
+  for (let i = 0; i < 10; i++) { a = advance(s, 40, 0, rects); s = a.state; if (a.blocked) break; }
+  assert.equal(a.blocked, true);
+  assert.equal(a.send.id, "mac", "input keeps going to the device we can drive");
 });
 
 test("helpers", () => {

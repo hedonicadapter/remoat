@@ -8,7 +8,7 @@
 //
 // Consequence: we keep a socket open to EVERY device, because a crossing has to be instant.
 import {
-  center, fitTransform, localOf, rectsFor, snapRect, stepPointer,
+  advance, center, fitTransform, localOf, rectsFor, snapRect,
 } from "./arrange.js";
 
 (() => {
@@ -149,7 +149,9 @@ import {
   const sendTo = (id, obj) => send(devices.get(id), obj);
   const sendActive = (obj) => sendTo(activeId, obj);
 
-  function setActive(id, { quiet = false } = {}) {
+  /// `keepCursor` is set when we're arriving by crossing an edge: the pointer is already
+  /// exactly where it should be (the entry edge), so re-placing it would undo the crossing.
+  function setActive(id, { quiet = false, keepCursor = false } = {}) {
     if (!devices.has(id) || id === activeId) return;
     const prev = activeId;
     activeId = id;
@@ -161,11 +163,12 @@ import {
     const d = devices.get(id);
     setStatus(d, d.status || "connecting");
     if (!quiet) showToast(`→ ${d.name}`);
-    placeCursor(id);
+    if (!keepCursor) placeCursor(id);
     render();
   }
 
-  /// Park the virtual cursor on a device (its middle, unless we're already there).
+  /// Park the virtual cursor on a device (its middle, unless told otherwise). `home` tells the
+  /// daemon to re-establish where the pointer is, which Linux needs whenever it teleports.
   function placeCursor(id, at) {
     const r = rectOf(id);
     if (!r) return;
@@ -173,7 +176,7 @@ import {
     cursor = { id, gx: p.gx, gy: p.gy, overshoot: 0 };
     if (r.known) {
       const l = localOf(rects(), id, cursor.gx, cursor.gy);
-      sendTo(id, { type: "move_abs", x: l.x, y: l.y });
+      sendTo(id, { type: "move_abs", x: l.x, y: l.y, home: true });
     }
   }
 
@@ -328,25 +331,25 @@ import {
     if (!cursor || !rs.some((r) => r.id === cursor.id)) placeCursor(activeId);
     if (!cursor) return;
 
-    const next = stepPointer(cursor, dx, dy, rs);
-    cursor = { id: next.id, gx: next.gx, gy: next.gy, overshoot: next.overshoot };
+    const step = advance(cursor, dx, dy, rs);
+    cursor = step.state;
 
-    if (next.blocked) {
+    if (step.blocked) {
       const now = Date.now();
       if (now - blockedAt > 3000) {   // don't spam while they keep shoving
         blockedAt = now;
-        const d = devices.get(next.blockedId);
+        const d = devices.get(step.blockedId);
         showToast(d && d.status === "untrusted"
           ? `${d.name}: accept its certificate to cross`
           : `${d ? d.name : "device"} not connected`, "err");
       }
     }
-    if (next.crossed && next.id !== activeId) setActive(next.id);
-
-    const r = rs.find((x) => x.id === cursor.id);
-    if (!r || !r.known) return;
-    const l = localOf(rs, cursor.id, cursor.gx, cursor.gy);
-    sendTo(cursor.id, { type: "move_abs", x: l.x, y: l.y });
+    // keepCursor: `advance` already put the pointer on the entry edge; centring it here would
+    // throw that away and make every crossing land mid-screen.
+    if (step.crossed && step.state.id !== activeId) {
+      setActive(step.state.id, { keepCursor: true });
+    }
+    if (step.send) sendTo(step.send.id, { type: "move_abs", ...step.send });
   }
 
   pad.addEventListener("touchstart", (e) => {

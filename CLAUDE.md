@@ -25,6 +25,13 @@ bordering device. Design consequences worth understanding before changing any of
   write-only), so the phone integrates touch deltas into a global position and sends
   `move_abs`; the daemon reports its bounds (`screen` frame) and clamps. Relative `move` is
   still handled for older clients.
+- **On Linux, `move_abs` is emulated with relative deltas** — ydotool's absolute mode is broken
+  upstream (see Gotchas). The daemon tracks where it last put the pointer; `home: true` (sent
+  when the pointer teleports: a crossing or a switch) re-establishes that by slamming into a
+  corner. Pointer acceleration means the model and the real pointer drift apart mid-screen;
+  targets on an edge are overshot deliberately so every edge contact re-pins both — and
+  reaching an edge is exactly what crossing requires. macOS has real absolute placement, so
+  none of this applies there.
 - **One coordinate space.** Every device is a rect in the same space, so a crossing needs no
   mapping maths — the global coordinate is continuous across the seam, which is why you exit
   and enter at the same height. Geometry lives in `web/arrange.js` (pure, unit-tested).
@@ -123,6 +130,10 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   unit-tested (`input.rs::keyargs`), the *bindings* aren't.
 - PWA settings screen that edits `commands.toml` over WS (`{type:"config_set",…}`) — the
   file format is ready for it; the WS message is not implemented.
+- Exact pointer tracking on Linux needs a real absolute device: either remoat creating its own
+  uinput device WITH an ABS range (needs `/dev/uinput` access, like ydotool's group) or the
+  `wlr-virtual-pointer` protocol's `motion_absolute` — niri support unverified. Either removes
+  the acceleration drift and the corner-homing slam entirely.
 - Arrangement gaps worth knowing: bounds are ONE rect per device starting at 0,0 — on mac
   that's the main display only (enigo has no virtual-desktop query), so a second monitor on a
   mac isn't reachable by crossing. Linux unions its monitors via hyprctl/wlr-randr, so it is.
@@ -188,6 +199,18 @@ Where the implementation deviates from the original design note:
 ## Gotchas (hard-won — don't rediscover)
 
 - **`lsof` hangs on the dev Mac** — use `pgrep`/`pkill` or a Python bind-test instead.
+- **`ydotool mousemove -a` (absolute) is useless — don't reach for it again.** `ydotoold` never
+  calls `UI_ABS_SETUP` (grep the 1.0.4 source: no `absinfo` anywhere), so `ABS_X`/`ABS_Y` keep
+  `absmin=absmax=0` and *every* absolute coordinate collapses to 0,0. ABS isn't even enabled by
+  default (`ENABLE_REL | ENABLE_KEY`). Upstream: ReimuNotMoe/ydotool#250. Shipped once on the
+  strength of a dry-run argv check; on real niri hardware it parked the pointer in the top-left
+  corner, which is **niri's default hot corner**, so the Overview opened every time. Absolute
+  placement on Linux is therefore emulated from relative deltas (`input.rs::abs_to_rel`).
+- **Nothing can pin both pointer axes without visiting a corner**, so relative backends home by
+  slamming into one — never the top-left (niri's default hot corner, GNOME's Activities).
+  `home_corner()` picks the nearest of the other three; a test asserts it never returns 0,0.
+- **A dry-run argv check is not hardware verification.** Both ydotool bugs so far (the `-w`
+  wheel flags, then this) passed dry-run and failed on the real box.
 - **An inhibitor child outlives a killed daemon.** Measured: SIGTERM to the daemon left
   `caffeinate -d -i` asserting forever (nothing runs `Drop`). Hence the pid leash
   (`caffeinate -w <pid>`, `tail --pid=<pid>`) — the signal handler alone can't cover SIGKILL.

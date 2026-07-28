@@ -160,6 +160,31 @@ export function stepPointer(state, dx, dy, rects, opts = {}) {
   return { id: to.id, gx: e.gx, gy: e.gy, overshoot: 0, crossed: true, blocked: false, from: cur.id, dir };
 }
 
+/// One touch delta -> next pointer state + exactly what to put on the wire.
+///
+/// The `send` payload is produced here rather than by the caller so the landing point of a
+/// crossing can't be overwritten downstream: a crossing MUST place the pointer on the entry
+/// edge, not wherever the new device was last left. `home` asks the daemon to re-establish
+/// where the pointer is (see input.rs — Linux has to emulate absolute moves), which is needed
+/// exactly when the pointer teleports: a crossing or a deliberate switch.
+export function advance(state, dx, dy, rects) {
+  const next = stepPointer(state, dx, dy, rects);
+  const to = rects.find((r) => r.id === next.id);
+  const out = {
+    state: { id: next.id, gx: next.gx, gy: next.gy, overshoot: next.overshoot },
+    crossed: !!next.crossed,
+    blocked: !!next.blocked,
+    blockedId: next.blockedId,
+    from: next.from,
+    send: null,
+  };
+  if (to && to.known) {
+    const l = localOf(rects, next.id, next.gx, next.gy);
+    out.send = { id: next.id, x: l.x, y: l.y, home: out.crossed };
+  }
+  return out;
+}
+
 /// Device-space point -> that device's own local coordinates (what move_abs wants).
 export function localOf(rects, id, gx, gy) {
   const r = rects.find((x) => x.id === id);

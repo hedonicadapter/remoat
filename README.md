@@ -160,6 +160,18 @@ to each other's edges), and the cursor treats that layout as one big desktop:
 Everything else — clicks, scrolling, dictation, voice commands, the wake lock — follows the
 cursor to whichever device it's on.
 
+> **Wayland/Linux caveats.** `ydotool` can't place a pointer at an absolute position (its
+> absolute mode collapses to the top-left corner — upstream bug), so on Linux the daemon walks
+> the pointer there with relative moves instead. Two consequences: taking over a device (or
+> crossing into one) flicks the pointer via a screen corner to find its bearings, and pointer
+> acceleration makes tracking approximate between screen edges — each edge you push against
+> re-syncs it. For exact tracking, set a flat profile in niri: `input { mouse {
+> accel-profile "flat"; } }`.
+>
+> Also: niri's **top-left hot corner opens the Overview** by default, and pushing the cursor
+> along a left edge can clip it. Turn it off with `gestures { hot-corners { off } }` (or
+> per-output) if it gets in the way. remoat never homes the pointer into that corner on purpose.
+
 > **Each device's certificate must be accepted once.** Tiles for devices the browser hasn't
 > trusted yet show `tap to trust`; tapping opens that device's page so you can accept its
 > self-signed cert, after which its tile connects and becomes crossable. Until then the cursor

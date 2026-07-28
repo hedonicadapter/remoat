@@ -10,12 +10,16 @@ use std::process::{Command, Stdio};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
+use crate::screen::Bounds;
+
 #[derive(Debug, Clone)]
 pub enum InputCmd {
     Move { dx: f64, dy: f64 },
     /// Absolute placement. The phone owns the cursor position when devices are arranged, so
     /// edge crossing can warp the pointer to the exact entry point on the next device.
-    MoveAbs { x: i32, y: i32 },
+    /// `home` = the pointer is teleporting (a crossing or a device switch), so a backend that
+    /// only has relative motion must re-establish where the pointer actually is first.
+    MoveAbs { x: i32, y: i32, home: bool },
     Click { button: String, double: bool },
     Scroll { dx: f64, dy: f64 },
     Text(String),
@@ -26,7 +30,7 @@ pub enum InputCmd {
 pub trait Backend {
     fn name(&self) -> &'static str;
     fn move_rel(&mut self, dx: f64, dy: f64);
-    fn move_abs(&mut self, x: i32, y: i32);
+    fn move_abs(&mut self, x: i32, y: i32, home: bool);
     fn click(&mut self, button: &str, double: bool);
     fn scroll(&mut self, dx: f64, dy: f64);
     fn text(&mut self, s: &str);
@@ -36,7 +40,7 @@ pub trait Backend {
     fn apply(&mut self, cmd: InputCmd) {
         match cmd {
             InputCmd::Move { dx, dy } => self.move_rel(dx, dy),
-            InputCmd::MoveAbs { x, y } => self.move_abs(x, y),
+            InputCmd::MoveAbs { x, y, home } => self.move_abs(x, y, home),
             InputCmd::Click { button, double } => self.click(&button, double),
             InputCmd::Scroll { dx, dy } => self.scroll(dx, dy),
             InputCmd::Text(s) => self.text(&s),
@@ -47,10 +51,10 @@ pub trait Backend {
 }
 
 /// Spawn the input worker thread. Backend is chosen on that thread (enigo is !Send).
-pub fn spawn_worker() -> UnboundedSender<InputCmd> {
+pub fn spawn_worker(bounds: Bounds) -> UnboundedSender<InputCmd> {
     let (tx, mut rx) = unbounded_channel::<InputCmd>();
     std::thread::spawn(move || {
-        let mut backend = pick_backend();
+        let mut backend = pick_backend(bounds);
         eprintln!("[input] backend: {}", backend.name());
         while let Some(cmd) = rx.blocking_recv() {
             backend.apply(cmd);
@@ -59,27 +63,27 @@ pub fn spawn_worker() -> UnboundedSender<InputCmd> {
     tx
 }
 
-fn pick_backend() -> Box<dyn Backend> {
+fn pick_backend(bounds: Bounds) -> Box<dyn Backend> {
     let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
     let choice = std::env::var("REMOAT_BACKEND").unwrap_or_else(|_| "auto".into()).to_lowercase();
     match choice.as_str() {
-        "ydotool" => Box::new(YdotoolBackend { dryrun }),
+        "ydotool" => Box::new(YdotoolBackend::new(dryrun, bounds)),
         "enigo" => make_enigo(),
         "null" => Box::new(NullBackend::new("forced via REMOAT_BACKEND".into())),
-        _ => auto_backend(dryrun), // macOS -> enigo; Linux -> ydotool (uinput); else null
+        _ => auto_backend(dryrun, bounds), // macOS -> enigo; Linux -> ydotool (uinput); else null
     }
 }
 
 #[cfg(target_os = "macos")]
-fn auto_backend(_dryrun: bool) -> Box<dyn Backend> {
+fn auto_backend(_dryrun: bool, _bounds: Bounds) -> Box<dyn Backend> {
     make_enigo()
 }
 #[cfg(target_os = "linux")]
-fn auto_backend(dryrun: bool) -> Box<dyn Backend> {
-    Box::new(YdotoolBackend { dryrun })
+fn auto_backend(dryrun: bool, bounds: Bounds) -> Box<dyn Backend> {
+    Box::new(YdotoolBackend::new(dryrun, bounds))
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn auto_backend(_dryrun: bool) -> Box<dyn Backend> {
+fn auto_backend(_dryrun: bool, _bounds: Bounds) -> Box<dyn Backend> {
     Box::new(NullBackend::new("unsupported platform".into()))
 }
 
@@ -133,7 +137,8 @@ impl Backend for EnigoBackend {
     fn move_rel(&mut self, dx: f64, dy: f64) {
         let _ = self.enigo.move_mouse(dx.round() as i32, dy.round() as i32, Coordinate::Rel);
     }
-    fn move_abs(&mut self, x: i32, y: i32) {
+    fn move_abs(&mut self, x: i32, y: i32, _home: bool) {
+        // Quartz takes real absolute coordinates, so there is nothing to re-establish.
         let _ = self.enigo.move_mouse(x, y, Coordinate::Abs);
     }
     fn click(&mut self, button: &str, double: bool) {
@@ -196,11 +201,24 @@ pub fn key_known(name: &str) -> bool {
     }
 }
 
+/// Overshoot used when a target sits on an edge, so the compositor's own clamping puts the
+/// pointer exactly there. Edges are the only place a relative backend can resynchronise.
+const EDGE_PUSH: i32 = 40;
+
 struct YdotoolBackend {
     dryrun: bool,
+    /// Desktop size, needed to emulate absolute placement.
+    bounds: Bounds,
+    /// Where we last commanded the pointer to be. `None` = unknown (nothing sent yet, or a
+    /// raw relative move moved it out from under us).
+    pos: Option<(i32, i32)>,
 }
 
 impl YdotoolBackend {
+    fn new(dryrun: bool, bounds: Bounds) -> Self {
+        YdotoolBackend { dryrun, bounds, pos: None }
+    }
+
     fn run(&self, args: &[String]) {
         if self.dryrun {
             println!("[dryrun] ydotool {}", args.join(" "));
@@ -213,12 +231,42 @@ impl YdotoolBackend {
             self.run(&args);
         }
     }
+
+    /// Corner to slam into for a known origin: the nearest one, but NEVER top-left — that is
+    /// the hot corner on niri and GNOME, and homing there pops the overview open.
+    fn home_corner(&self, x: i32, y: i32) -> (i32, i32) {
+        let (w, h) = (self.bounds.w - 1, self.bounds.h - 1);
+        [(0, h), (w, h), (w, 0)]
+            .into_iter()
+            .min_by_key(|(cx, cy)| (cx - x).pow(2) + (cy - y).pow(2))
+            .unwrap()
+    }
 }
 
-/// Absolute move: `-a` switches mousemove from relative to absolute. Both axes are required
-/// (same quirk as the wheel — omitting one makes ydotool dump usage instead of moving).
-fn absargs(x: i32, y: i32) -> Vec<String> {
-    vec!["mousemove".into(), "-a".into(), "-x".into(), x.to_string(), "-y".into(), y.to_string()]
+fn relargs(dx: i32, dy: i32) -> Vec<String> {
+    vec!["mousemove".into(), "-x".into(), dx.to_string(), "-y".into(), dy.to_string()]
+}
+
+/// Delta that drives the pointer into `corner` from ANYWHERE: both axes always move a full
+/// two screens toward it, so the compositor's clamping does the positioning. Deriving the
+/// direction from the corner and not from the target matters — a target already sharing an
+/// axis with the corner would otherwise leave that axis un-pinned, i.e. still unknown.
+fn home_slam(corner: (i32, i32), b: Bounds) -> (i32, i32) {
+    let sx = if corner.0 == 0 { -1 } else { 1 };
+    let sy = if corner.1 == 0 { -1 } else { 1 };
+    (sx * b.w * 2, sy * b.h * 2)
+}
+
+/// Delta that walks the pointer from `from` to `to`, overshooting when the target is on an
+/// edge. The overshoot is what keeps this honest: pointer acceleration means a delta of N does
+/// not move exactly N pixels, so error accumulates — but every edge contact re-pins both the
+/// real pointer and our idea of it, and reaching an edge is exactly what crossing requires.
+fn abs_to_rel(from: (i32, i32), to: (i32, i32), b: Bounds) -> (i32, i32) {
+    let mut dx = to.0 - from.0;
+    let mut dy = to.1 - from.1;
+    if to.0 <= 0 { dx -= EDGE_PUSH } else if to.0 >= b.w - 1 { dx += EDGE_PUSH }
+    if to.1 <= 0 { dy -= EDGE_PUSH } else if to.1 >= b.h - 1 { dy += EDGE_PUSH }
+    (dx, dy)
 }
 
 /// `["ctrl","home"]` -> `key 29:1 102:1 102:0 29:1`. Press in order, release in reverse.
@@ -237,11 +285,31 @@ fn keyargs(names: &[String]) -> Option<Vec<String>> {
 impl Backend for YdotoolBackend {
     fn name(&self) -> &'static str { "ydotool" }
     fn move_rel(&mut self, dx: f64, dy: f64) {
-        self.run(&["mousemove".into(), "-x".into(), (dx.round() as i32).to_string(),
-                   "-y".into(), (dy.round() as i32).to_string()]);
+        self.run(&relargs(dx.round() as i32, dy.round() as i32));
+        self.pos = None; // an old-style relative client is driving; we no longer know where we are
     }
-    fn move_abs(&mut self, x: i32, y: i32) {
-        self.run(&absargs(x, y));
+
+    /// ydotool cannot place a pointer absolutely: `ydotoold` never gives its uinput device an
+    /// ABS range (no UI_ABS_SETUP anywhere in ydotool 1.0.4), so every absolute event collapses
+    /// to 0,0 — upstream issue #250, and on a compositor with a top-left hot corner that means
+    /// the pointer parks there and opens an overview. So absolute placement is emulated with
+    /// relative deltas from the last commanded position.
+    fn move_abs(&mut self, x: i32, y: i32, home: bool) {
+        let (x, y) = self.bounds.clamp(x, y);
+        if home || self.pos.is_none() {
+            // Teleporting (crossing in, or a device switch): slam into a corner so the
+            // compositor's clamping gives us a known origin to move from.
+            let corner = self.home_corner(x, y);
+            let (sx, sy) = home_slam(corner, self.bounds);
+            self.run(&relargs(sx, sy));
+            self.pos = Some(corner);
+        }
+        let from = self.pos.unwrap_or((x, y));
+        let (dx, dy) = abs_to_rel(from, (x, y), self.bounds);
+        if dx != 0 || dy != 0 {
+            self.run(&relargs(dx, dy));
+        }
+        self.pos = Some((x, y));
     }
     fn click(&mut self, button: &str, double: bool) {
         let code = match button { "right" => "0xC1", "middle" => "0xC2", _ => "0xC0" };
@@ -296,7 +364,7 @@ impl NullBackend {
 impl Backend for NullBackend {
     fn name(&self) -> &'static str { "null" }
     fn move_rel(&mut self, _: f64, _: f64) {}
-    fn move_abs(&mut self, _: i32, _: i32) {}
+    fn move_abs(&mut self, _: i32, _: i32, _: bool) {}
     fn click(&mut self, _: &str, _: bool) {}
     fn scroll(&mut self, _: f64, _: f64) {}
     fn text(&mut self, _: &str) {}
@@ -334,8 +402,45 @@ mod tests {
         assert!(keyargs(&names(&["hyperkey"])).is_none());
     }
 
+    const B: Bounds = Bounds { w: 1920, h: 1080 };
+
     #[test]
-    fn ydotool_absolute_move_passes_both_axes() {
-        assert_eq!(absargs(1919, 0), names(&["mousemove", "-a", "-x", "1919", "-y", "0"]));
+    fn absolute_is_emulated_as_a_relative_delta() {
+        // ydotool's own absolute mode is unusable (no ABS range upstream), so a target becomes
+        // a delta from where we last put the pointer.
+        assert_eq!(abs_to_rel((100, 100), (400, 250), B), (300, 150));
+        assert_eq!(relargs(300, 150), names(&["mousemove", "-x", "300", "-y", "150"]));
+    }
+
+    #[test]
+    fn edge_targets_overshoot_so_the_compositor_pins_them() {
+        // The only resync a relative backend gets: shove past the edge and let it clamp.
+        assert_eq!(abs_to_rel((500, 500), (0, 500), B), (-500 - EDGE_PUSH, 0));
+        assert_eq!(abs_to_rel((500, 500), (1919, 500), B), (1419 + EDGE_PUSH, 0));
+        assert_eq!(abs_to_rel((500, 500), (500, 1079), B), (0, 579 + EDGE_PUSH));
+    }
+
+    #[test]
+    fn homing_slams_both_axes_regardless_of_the_target() {
+        // Regression: deriving the slam direction from the target meant a target that already
+        // shared an axis with the corner (e.g. x=0 entering from the left) left that axis
+        // un-pinned — so "homing" produced no known origin at all.
+        assert_eq!(home_slam((0, B.h - 1), B), (-3840, 2160));
+        assert_eq!(home_slam((B.w - 1, 0), B), (3840, -2160));
+        for corner in [(0, B.h - 1), (B.w - 1, B.h - 1), (B.w - 1, 0)] {
+            let (sx, sy) = home_slam(corner, B);
+            assert!(sx.abs() >= B.w && sy.abs() >= B.h, "slam must overshoot both axes");
+        }
+    }
+
+    #[test]
+    fn homing_never_picks_the_top_left_hot_corner() {
+        // Top-left opens the overview on niri and GNOME; homing there would pop it every time.
+        let b = YdotoolBackend::new(true, B);
+        for (x, y) in [(0, 0), (10, 10), (960, 540), (1919, 0), (0, 1079), (1919, 1079)] {
+            assert_ne!(b.home_corner(x, y), (0, 0), "homed into the hot corner from {x},{y}");
+        }
+        assert_eq!(b.home_corner(10, 10), (0, 1079), "nearest allowed corner");
+        assert_eq!(b.home_corner(1900, 20), (1919, 0));
     }
 }

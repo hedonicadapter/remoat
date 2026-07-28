@@ -117,8 +117,11 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
             "move_abs" => {
                 let x = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0) as i32;
                 let y = v.get("y").and_then(|x| x.as_f64()).unwrap_or(0.0) as i32;
+                // `home` = the pointer is teleporting here (crossing in, or a switch), so a
+                // relative-only backend must re-find it before moving.
+                let home = v.get("home").and_then(|x| x.as_bool()).unwrap_or(false);
                 let (x, y) = st.screen.clamp(x, y);
-                let _ = st.tx.send(InputCmd::MoveAbs { x, y });
+                let _ = st.tx.send(InputCmd::MoveAbs { x, y, home });
             }
             "click" => {
                 let button = v.get("button").and_then(|x| x.as_str()).unwrap_or("left").to_string();
@@ -325,13 +328,13 @@ async fn main() {
     let ip = tls::lan_ip();
     let name = gethostname::gethostname().to_string_lossy().split('.').next().unwrap_or("remoat").to_string();
 
-    let tx = input::spawn_worker();
+    let bounds = screen::detect();
+    let tx = input::spawn_worker(bounds);
     let disc = Discovery::start(name.clone(), ip.clone(), port);
     let (cert_pem, key_pem) = tls::ensure_cert();
     let wake = Arc::new(WakeLock::detect());
     eprintln!("[wake] inhibitor: {}", wake.describe());
     spawn_shutdown_release(wake.clone());
-    let bounds = screen::detect();
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
