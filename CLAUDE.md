@@ -87,18 +87,38 @@ real cursor. Two different bugs:
   `Arc<Mutex<SplitSink>>` and a receive-only stream; `move_abs` now `tokio::spawn`s the capture
   detached and sends the frame whenever it's ready, gated by an `AtomicBool` so a slow capture
   can't pile up a queue of overlapping subprocesses. The receive loop never waits on it.
-- **The offset is still open — root cause unconfirmed.** Leading theory: Hyprland positions
-  monitors in *physical* pixels (`hyprctl monitors -j`'s x/y/width/height, matching how
-  `screen.rs` already reads them), but grim's `-g` geometry — inherited from `slurp`, meant for
-  `wl_output`/xdg-output — is generally understood to want *logical* (post-scale) coordinates.
-  On an unscaled display the two coincide and nothing would look wrong; on a scaled one
-  (fractional or 2x, common on a Linux desktop) they don't, which would produce exactly a
-  fixed-direction offset. Second, weaker theory: the already-documented ydotool relative-motion
-  drift (see "Multi-device arrangement" above) — the crop is centered on the daemon's *believed*
-  position, which can differ from the real one. Distinguishing test: if the offset is present
-  immediately after connecting (before any dragging), it's the scale theory; if it's absent
-  right after crossing an edge (a `home` resync) and grows the further you drag from there, it's
-  drift. Whoever picks this up next: get `hyprctl monitors -j`'s `"scale"` field first.
+- **The offset + black bars were `screen.rs` reporting a desktop that doesn't exist.** Reporter
+  runs niri with a scale-1 laptop panel beside a scale-2 4K external. Three separate bugs
+  stacked up, all now fixed — see "Screen geometry" in Gotchas for the rule that prevents them:
+  1. **No niri support at all.** `platform_bounds` tried `hyprctl` → `wlr-randr` → `xrandr`;
+     under niri the first and last don't exist, and `wlr-randr` was *never in the flake's
+     `runtimeTools`* despite being referenced since the Python days. So it silently fell to the
+     1920x1080 FALLBACK on a 3840x1080 desktop. niri is now queried first via
+     `niri msg --json outputs`, whose `logical` rect is exactly right with no arithmetic.
+  2. **Physical mode sizes paired with logical positions.** Both the hyprctl and wlr-randr
+     parsers read `width`/`height` (the *physical* mode) and combined them with logical
+     positions. A 3840x2160 panel at scale 2 occupies 1920x1080 of layout, so the union
+     inflated to 5760x2160 against a real 3840x1080 — and since the phone drives the cursor
+     across the union and the crop is clamped to it, coordinates landed in space no output
+     covers. grim renders that as black. Both parsers now divide by `scale` (and swap axes on
+     a 90°/270° transform).
+  3. **Origin assumed 0,0.** A monitor placed left of or above the primary makes the layout
+     origin negative; every crop was then shifted by that whole offset. `Bounds` now carries
+     `ox`/`oy`, the phone still gets a 0-based `w`x`h`, and capture translates.
+- **Capture crops are confined to the monitor under the cursor**, not the union — a union of
+  mismatched monitors has uncovered gaps, and a crop reaching into one comes back with black
+  bars. A cursor in a gap snaps to the nearest output. This makes black bars structurally
+  impossible rather than merely unlikely.
+- Verified end-to-end on the dev box against a stand-in `niri` reporting the reporter's exact
+  arrangement, driven over real WS/TLS: union `3840x1080`, and grim geometry correct at five
+  probes including the two that used to break — a cursor 20px from the seam stays inside the
+  laptop (`1440,780 480x300`), and one *on* the seam snaps fully onto the external
+  (`1920,390 480x300`). Nothing exceeds the real bounds. 50 unit tests, including the
+  mixed-scale JSON for all three parsers (that parsing is split from the shell-out precisely so
+  it's testable without the compositor — same reason as `input.rs::keyargs`).
+- **The lag fix is measured, not assumed:** with a stand-in `grim` sleeping 600ms (5×
+  `CAPTURE_INTERVAL`), 12 pings interleaved with capture-triggering `move_abs` all answered in
+  ≤2ms while frames still arrived. Inline-awaited, they'd have queued ~600ms behind it.
 - **No auth gate on this** (see "Open threads" — it was already the top-priority gap for input;
   this adds live screen contents to what an unauthenticated LAN client can pull).
 
@@ -266,6 +286,18 @@ Where the implementation deviates from the original design note:
   `home_corner()` picks the nearest of the other three; a test asserts it never returns 0,0.
 - **A dry-run argv check is not hardware verification.** Both ydotool bugs so far (the `-w`
   wheel flags, then this) passed dry-run and failed on the real box.
+- **Screen geometry: everything outside a monitor's own mode is LOGICAL (post-scale).** Pointer
+  positions, compositor layout positions, and `grim -g` all live in logical coordinates; only
+  `mode.width`/`height` (wlr-randr) and `width`/`height` (hyprctl) are physical. Pairing the two
+  is invisible at scale 1 and silently wrong at any other scale — it inflated the desktop and
+  sent capture crops into uncovered space. Divide by `scale`, and prefer a compositor that hands
+  you the logical rect outright (`niri msg --json outputs` → `logical`). Also: don't assume the
+  layout origin is 0,0, and don't assume the union is fully covered by outputs.
+- **A tool referenced in code is not a tool on PATH.** `wlr-randr` was in `screen.rs`'s fallback
+  chain but never in the flake's `runtimeTools`, so on niri the whole chain missed and the
+  1920x1080 default took over — with no error, because every probe "just" returned None. When
+  adding a shell-out, add it to `runtimeTools` in the same commit, and make detection log what
+  it actually found (`[screen]` now prints every monitor rect).
 - **An inhibitor child outlives a killed daemon.** Measured: SIGTERM to the daemon left
   `caffeinate -d -i` asserting forever (nothing runs `Drop`). Hence the pid leash
   (`caffeinate -w <pid>`, `tail --pid=<pid>`) — the signal handler alone can't cover SIGKILL.

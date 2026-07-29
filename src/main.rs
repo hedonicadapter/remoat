@@ -45,7 +45,9 @@ struct AppState {
     tx: UnboundedSender<InputCmd>,
     disc: Arc<Discovery>,
     wake: Arc<WakeLock>,
-    screen: screen::Bounds,
+    /// Desktop union + its individual monitors. Capture needs the monitors (a crop must stay
+    /// inside one output), so the whole layout is carried, not just the bounds.
+    layout: Arc<screen::Layout>,
     name: String,
 }
 
@@ -76,7 +78,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> impl In
 /// never has to ask before arranging.
 fn screen_frame(st: &AppState) -> String {
     json!({"type":"screen","name":st.name,"platform":discovery::platform_label(),
-           "w":st.screen.w,"h":st.screen.h})
+           "w":st.layout.bounds.w,"h":st.layout.bounds.h})
     .to_string()
 }
 
@@ -147,7 +149,7 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                 // `home` = the pointer is teleporting here (crossing in, or a switch), so a
                 // relative-only backend must re-find it before moving.
                 let home = v.get("home").and_then(|x| x.as_bool()).unwrap_or(false);
-                let (x, y) = st.screen.clamp(x, y);
+                let (x, y) = st.layout.bounds.clamp(x, y);
                 let _ = st.tx.send(InputCmd::MoveAbs { x, y, home });
 
                 // Piggyback the capture frame on the move itself — the crop is centered on
@@ -158,13 +160,13 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                 let due = last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true);
                 if capturing && due && !capture_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     last_capture = Some(std::time::Instant::now());
-                    let bounds = st.screen;
+                    let layout = st.layout.clone();
                     let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
                     let sink = sink.clone();
                     let busy = capture_busy.clone();
                     tokio::spawn(async move {
                         let frame = tokio::task::spawn_blocking(move || {
-                            capture::capture_around(x, y, bounds, dryrun)
+                            capture::capture_around(x, y, &layout, dryrun)
                         })
                         .await
                         .unwrap_or(None);
@@ -391,8 +393,8 @@ async fn main() {
     let ip = tls::lan_ip();
     let name = gethostname::gethostname().to_string_lossy().split('.').next().unwrap_or("remoat").to_string();
 
-    let bounds = screen::detect();
-    let tx = input::spawn_worker(bounds);
+    let layout = Arc::new(screen::detect());
+    let tx = input::spawn_worker(layout.bounds);
     let disc = Discovery::start(name.clone(), ip.clone(), port);
     let (cert_pem, key_pem) = tls::ensure_cert();
     let wake = Arc::new(WakeLock::detect());
@@ -403,7 +405,7 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/", get(index))
         .fallback_service(ServeDir::new(web_dir()))
-        .with_state(AppState { tx, disc, wake, screen: bounds, name: name.clone() });
+        .with_state(AppState { tx, disc, wake, layout, name: name.clone() });
 
     let config = RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
         .await

@@ -402,7 +402,7 @@ mod tests {
         assert!(keyargs(&names(&["hyperkey"])).is_none());
     }
 
-    const B: Bounds = Bounds { w: 1920, h: 1080 };
+    const B: Bounds = Bounds::of(1920, 1080);
 
     #[test]
     fn absolute_is_emulated_as_a_relative_delta() {

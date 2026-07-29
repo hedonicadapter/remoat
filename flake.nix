@@ -16,8 +16,11 @@
         # wl-clipboard; grim captures the touchpad's live cursor-area preview via
         # wlr-screencopy (Hyprland and other wlroots compositors); openssl is not required
         # by the Rust build (rcgen) but harmless.
+        # wlr-randr is the screen-bounds fallback for compositors without their own IPC
+        # (niri and Hyprland are queried directly); it was referenced by screen.rs long
+        # before it was ever actually on PATH, which silently forced the 1920x1080 default.
         runtimeTools = lib.optionals stdenv.isLinux
-          (with pkgs; [ ydotool wl-clipboard xdg-utils grim ]);
+          (with pkgs; [ ydotool wl-clipboard xdg-utils grim wlr-randr ]);
 
         src = builtins.path {
           name = "remoat-src";

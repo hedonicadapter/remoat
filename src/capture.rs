@@ -5,25 +5,22 @@
 //!   macOS         -> `screencapture` (built in; needs Screen Recording permission granted to
 //!                     the launching terminal on Catalina+, same story as Accessibility for
 //!                     enigo — see CLAUDE.md gotchas).
-//!   Linux/Wayland -> `grim` (wlr-screencopy; works on Hyprland and other wlroots compositors,
-//!                     NOT under a plain XDG portal flow — no permission dialog per frame).
-//! Neither backend has been exercised against real hardware from this dev environment: only
-//! the region math and argv construction are unit-tested here (the same honesty as the
-//! ydotool dry-run caveat already documented for input).
+//!   Linux/Wayland -> `grim` (wlr-screencopy; works on niri, Hyprland and other wlroots-style
+//!                     compositors, NOT a portal flow, so no permission dialog per frame).
+//!
+//! Two things make the crop land where the cursor actually is, both learned the hard way:
+//!   - The region is in the compositor's **logical** coordinate space (see screen.rs). grim's
+//!     `-g` wants logical coords; feeding it physical ones offsets every crop on a scaled
+//!     monitor.
+//!   - The region is clamped into **the monitor under the cursor**, not the desktop union. A
+//!     union is not necessarily fully covered by outputs — mixed sizes or a non-grid
+//!     arrangement leave gaps, and grim renders anything uncovered as black bars.
 
 use std::process::Command;
 
-use crate::screen::Bounds;
+use crate::screen::{Layout, Rect};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-}
-
-/// Crop size around the cursor. `REMOAT_CAPTURE_SIZE=WxH` overrides.
+/// Crop size around the cursor, in logical pixels. `REMOAT_CAPTURE_SIZE=WxH` overrides.
 const DEFAULT_W: i32 = 480;
 const DEFAULT_H: i32 = 300;
 
@@ -40,21 +37,37 @@ fn capture_size() -> (i32, i32) {
     (DEFAULT_W, DEFAULT_H)
 }
 
-/// Region of `size` centered on (cx, cy), clamped inside `bounds` — and shrunk to fit a
-/// desktop smaller than the requested crop.
-pub fn region_around(cx: i32, cy: i32, size: (i32, i32), bounds: Bounds) -> Rect {
-    let w = size.0.min(bounds.w);
-    let h = size.1.min(bounds.h);
-    let x = (cx - w / 2).clamp(0, bounds.w - w);
-    let y = (cy - h / 2).clamp(0, bounds.h - h);
-    Rect { x, y, w, h }
+/// Region of `size` centered on a desktop-local cursor position, translated into compositor
+/// logical coordinates and confined to whichever monitor holds the cursor.
+pub fn region_around(cx: i32, cy: i32, size: (i32, i32), layout: &Layout) -> Rect {
+    // Phone coords are 0-based over the union; the compositor's are not.
+    let gx = cx + layout.bounds.ox;
+    let gy = cy + layout.bounds.oy;
+    // Confining the crop to one output is what guarantees every pixel is covered. The cursor
+    // CAN sit outside every monitor — the phone drives it over the union, and a union of
+    // mismatched monitors has uncovered gaps — so fall back to the nearest output rather than
+    // to the union, which would put the black bars right back.
+    let host = layout
+        .monitors
+        .iter()
+        .find(|m| m.contains(gx, gy))
+        .or_else(|| layout.monitors.iter().min_by_key(|m| m.dist2(gx, gy)))
+        .copied()
+        .unwrap_or_else(|| layout.bounds.rect());
+    let w = size.0.min(host.w);
+    let h = size.1.min(host.h);
+    Rect {
+        x: (gx - w / 2).clamp(host.x, host.x + host.w - w),
+        y: (gy - h / 2).clamp(host.y, host.y + host.h - h),
+        w,
+        h,
+    }
 }
 
-/// Capture the region around (cx, cy). `None` means the shell-out failed, wasn't available, or
-/// this call was a dry run — the caller just skips sending a frame.
-pub fn capture_around(cx: i32, cy: i32, bounds: Bounds, dryrun: bool) -> Option<Vec<u8>> {
-    let r = region_around(cx, cy, capture_size(), bounds);
-    platform_capture(r, dryrun)
+/// Capture the region around a desktop-local (cx, cy). `None` means the shell-out failed, the
+/// tool was missing, or this was a dry run — the caller just skips sending a frame.
+pub fn capture_around(cx: i32, cy: i32, layout: &Layout, dryrun: bool) -> Option<Vec<u8>> {
+    platform_capture(region_around(cx, cy, capture_size(), layout), dryrun)
 }
 
 #[cfg(target_os = "macos")]
@@ -96,22 +109,76 @@ fn platform_capture(r: Rect, dryrun: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const B: Bounds = Bounds { w: 1920, h: 1080 };
+    use crate::screen::Bounds;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+    fn layout(bounds: Bounds, monitors: Vec<Rect>) -> Layout {
+        Layout { bounds, monitors }
+    }
+    fn single(w: i32, h: i32) -> Layout {
+        let b = Bounds::of(w, h);
+        layout(b, vec![b.rect()])
+    }
 
     #[test]
     fn centers_on_the_cursor() {
-        assert_eq!(region_around(960, 540, (480, 300), B), Rect { x: 720, y: 390, w: 480, h: 300 });
+        assert_eq!(
+            region_around(960, 540, (480, 300), &single(1920, 1080)),
+            rect(720, 390, 480, 300)
+        );
     }
 
     #[test]
     fn clamps_at_the_edges() {
-        assert_eq!(region_around(0, 0, (480, 300), B), Rect { x: 0, y: 0, w: 480, h: 300 });
-        assert_eq!(region_around(1919, 1079, (480, 300), B), Rect { x: 1440, y: 780, w: 480, h: 300 });
+        let l = single(1920, 1080);
+        assert_eq!(region_around(0, 0, (480, 300), &l), rect(0, 0, 480, 300));
+        assert_eq!(region_around(1919, 1079, (480, 300), &l), rect(1440, 780, 480, 300));
     }
 
     #[test]
     fn shrinks_to_fit_a_screen_smaller_than_the_crop() {
-        let tiny = Bounds { w: 200, h: 100 };
-        assert_eq!(region_around(50, 50, (480, 300), tiny), Rect { x: 0, y: 0, w: 200, h: 100 });
+        assert_eq!(region_around(50, 50, (480, 300), &single(200, 100)), rect(0, 0, 200, 100));
+    }
+
+    #[test]
+    fn stays_inside_the_monitor_under_the_cursor() {
+        // Two monitors of different heights: the union has an uncovered strip below the short
+        // one. A crop near their seam must not reach into it, or grim renders black bars.
+        let l = layout(
+            Bounds::of(3840, 1440),
+            vec![rect(0, 0, 1920, 1080), rect(1920, 0, 1920, 1440)],
+        );
+        let r = region_around(1900, 1000, (480, 300), &l);
+        assert_eq!(r, rect(1440, 780, 480, 300), "crop escaped the left monitor");
+        assert!(r.x + r.w <= 1920 && r.y + r.h <= 1080);
+    }
+
+    #[test]
+    fn a_cursor_in_an_uncovered_gap_snaps_to_the_nearest_output() {
+        // The union of mismatched monitors has uncovered space; the phone can drive the cursor
+        // into it. Cropping the union there would return black, so the nearest output wins.
+        let l = layout(
+            Bounds::of(3840, 1440),
+            vec![rect(0, 0, 1920, 1080), rect(1920, 0, 1920, 1440)],
+        );
+        // (500, 1300) is below the short left monitor — inside the union, on no output.
+        let r = region_around(500, 1300, (480, 300), &l);
+        assert_eq!(r, rect(260, 780, 480, 300));
+        assert!(l.monitors[0].contains(r.x, r.y), "crop must land on a real output");
+    }
+
+    #[test]
+    fn translates_local_coordinates_by_a_negative_origin() {
+        // A monitor left of the primary makes the layout origin negative; the phone still
+        // sends 0-based coords, so local 0 must land on the real left edge, not on x=0.
+        let l = layout(
+            Bounds { ox: -1920, oy: 0, w: 3840, h: 1080 },
+            vec![rect(-1920, 0, 1920, 1080), rect(0, 0, 1920, 1080)],
+        );
+        assert_eq!(region_around(0, 540, (480, 300), &l), rect(-1920, 390, 480, 300));
+        // Local 1920 is the second monitor's left edge.
+        assert_eq!(region_around(1920, 540, (480, 300), &l), rect(0, 390, 480, 300));
     }
 }
