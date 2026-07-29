@@ -78,6 +78,11 @@ main#pad {
   background: var(--pad); border: 1px solid var(--line); border-radius: 16px;
   overflow: hidden; touch-action: none;
 }
+#padspot {
+  position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(circle 130px at var(--cx, 50%) var(--cy, 50%),
+    color-mix(in srgb, var(--accent) 20%, transparent) 0%, transparent 72%);
+}
 #vbar { grid-column: 2; grid-row: 1; }
 #hbar { grid-column: 1; grid-row: 2; }
 .scrollbar {

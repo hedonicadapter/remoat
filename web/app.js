@@ -178,6 +178,16 @@ import {
       const l = localOf(rects(), id, cursor.gx, cursor.gy);
       sendTo(id, { type: "move_abs", x: l.x, y: l.y, home: true });
     }
+    updatePadSpot();
+  }
+
+  // ---- touchpad background: a soft glow at the cursor's actual position on its screen, so the
+  // pad gives a spatial sense of where the pointer is without looking up at the desktop.
+  function updatePadSpot() {
+    const r = cursor && rectOf(cursor.id);
+    const l = r ? localOf(rects(), cursor.id, cursor.gx, cursor.gy) : null;
+    pad.style.setProperty("--cx", l ? `${(l.x / r.w) * 100}%` : "50%");
+    pad.style.setProperty("--cy", l ? `${(l.y / r.h) * 100}%` : "50%");
   }
 
   // ---- toast ----
@@ -202,6 +212,7 @@ import {
     const d = active();
     devName.textContent = d ? d.name : "connecting…";
     statusDot.className = "dot" + (d && d.status === "connected" ? " on" : "");
+    updatePadSpot();
     if (panel.hidden) return;
 
     const rs = rects();
@@ -350,6 +361,7 @@ import {
       setActive(step.state.id, { keepCursor: true });
     }
     if (step.send) sendTo(step.send.id, { type: "move_abs", ...step.send });
+    updatePadSpot();
   }
 
   pad.addEventListener("touchstart", (e) => {
