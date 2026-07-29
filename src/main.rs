@@ -1,11 +1,16 @@
 //! remoat daemon — serves the PWA, a WebSocket control channel, over HTTPS.
 //!
-//! Protocol (JSON over WS):
-//!   client -> server: {type:"hello"|"move"|"move_abs"|"click"|"scroll"|"text"|"command"
-//!                          |"wake"|"ping", ...}
-//!   server -> client: {type:"devices"|"screen"|"command_result"|"wake_state"|"pong", ...}
+//! Protocol:
+//!   client -> server (JSON): {type:"hello"|"move"|"move_abs"|"click"|"scroll"|"text"
+//!                                 |"command"|"wake"|"capture"|"ping", ...}
+//!   server -> client (JSON): {type:"devices"|"screen"|"command_result"|"wake_state"|"pong", ...}
+//!   server -> client (binary): a PNG crop of the desktop around the cursor, sent while a
+//!                              client has capture on (see capture.rs) — throttled to
+//!                              CAPTURE_INTERVAL and driven off move_abs, so it needs no
+//!                              timer of its own.
 
 mod actions;
+mod capture;
 mod commands;
 mod config;
 mod discovery;
@@ -49,6 +54,11 @@ struct AppState {
 /// Wi-Fi, killed tab) must not pin the display on indefinitely.
 const WAKE_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Minimum gap between capture frames per connection. Shelling out to a screenshot tool on
+/// every touchmove would be ~60 spawns/sec; this caps it to a still-live-feeling ~8fps.
+/// Picked, not measured — no real hardware to profile against from this dev environment.
+const CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+
 fn web_dir() -> String {
     std::env::var("REMOAT_WEB_DIR").unwrap_or_else(|_| "web".into())
 }
@@ -81,6 +91,9 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
 
     // At most one wake reference per connection, released on blur, idle, or disconnect.
     let mut holding = false;
+    // Capture streaming: on only while this client is actively dragging (see "capture" below).
+    let mut capturing = false;
+    let mut last_capture: Option<std::time::Instant> = None;
 
     loop {
         let msg = match tokio::time::timeout(WAKE_IDLE, socket.recv()).await {
@@ -122,6 +135,23 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                 let home = v.get("home").and_then(|x| x.as_bool()).unwrap_or(false);
                 let (x, y) = st.screen.clamp(x, y);
                 let _ = st.tx.send(InputCmd::MoveAbs { x, y, home });
+
+                // Piggyback the capture frame on the move itself — the crop is centered on
+                // exactly this position, and the drag already produces these messages at a
+                // steady rate, so there's no separate timer to drift out of sync.
+                if capturing && last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true) {
+                    last_capture = Some(std::time::Instant::now());
+                    let bounds = st.screen;
+                    let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
+                    let frame = tokio::task::spawn_blocking(move || {
+                        capture::capture_around(x, y, bounds, dryrun)
+                    })
+                    .await
+                    .unwrap_or(None);
+                    if let Some(bytes) = frame {
+                        let _ = socket.send(Message::Binary(bytes)).await;
+                    }
+                }
             }
             "click" => {
                 let button = v.get("button").and_then(|x| x.as_str()).unwrap_or("left").to_string();
@@ -213,6 +243,12 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                             .to_string(),
                     ))
                     .await;
+            }
+            // The phone requests frames only while it's actively dragging — on:false both
+            // stops new spawns and lets `capturing` gate out any in-flight straggler's effect
+            // on the next loop iteration.
+            "capture" => {
+                capturing = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
             }
             "hello" => {
                 let _ = socket.send(Message::Text(screen_frame(&st))).await;

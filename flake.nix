@@ -13,9 +13,11 @@
         inherit (pkgs) lib stdenv;
 
         # Tools the daemon shells out to at runtime. Linux/Wayland needs ydotool +
-        # wl-clipboard; openssl is not required by the Rust build (rcgen) but harmless.
+        # wl-clipboard; grim captures the touchpad's live cursor-area preview via
+        # wlr-screencopy (Hyprland and other wlroots compositors); openssl is not required
+        # by the Rust build (rcgen) but harmless.
         runtimeTools = lib.optionals stdenv.isLinux
-          (with pkgs; [ ydotool wl-clipboard xdg-utils ]);
+          (with pkgs; [ ydotool wl-clipboard xdg-utils grim ]);
 
         src = builtins.path {
           name = "remoat-src";

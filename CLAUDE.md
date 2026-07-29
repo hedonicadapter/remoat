@@ -57,6 +57,29 @@ appears/disappears with focus, survives one of two clients leaving, and is relea
 close, abrupt socket drop, 90s client silence, SIGTERM **and SIGKILL**. Linux inhibitor
 argv is unexercised (no Linux box) — see "Open threads".
 
+**Touchpad live capture BUILT** (`src/capture.rs`), from a cloud session with no display —
+verified by `cargo build`/`cargo test` (region-clamping math + argv construction only, same
+honesty as the ydotool dry-run caveat below) and by inspecting rendered WS traffic logic, NOT
+by watching a real phone show a real screen. Treat platform capture as unexercised until
+someone confirms it on hardware.
+- The touchpad background used to be a CSS glow at the cursor's relative position; it's now a
+  live PNG crop of the actual desktop around the cursor (`#padcap` in `web/app.js`), because a
+  glow doesn't answer "what's actually under my finger right now."
+- **Shells out to a platform screenshot tool, same pattern as ydotool for input**: `screencapture`
+  on macOS, `grim` on Linux (wlr-screencopy — works on Hyprland and other wlroots compositors,
+  NOT a portal flow, so no per-frame permission dialog). `grim` is in the flake's Linux
+  `runtimeTools`; `screencapture` is a macOS system binary, nothing to add.
+- **Driven off `move_abs`, not its own timer.** The client sends `{type:"capture",on:true}` on
+  touchstart / `false` on touchend (mirrors the wake-lock on/off pattern); while on, the daemon
+  captures a crop centered on the position it *just moved to* and pushes it back as a binary WS
+  frame, throttled to `CAPTURE_INTERVAL` (120ms, ~8fps — picked, not profiled). A crossing
+  mid-drag moves the capture request to the new active device the same way it moves the wake
+  lock (`setActive` in `app.js`).
+- Crop size defaults to 480×300, overridable with `REMOAT_CAPTURE_SIZE=WxH` (mirrors
+  `REMOAT_SCREEN`). Region math shrinks-and-clamps to fit inside the actual desktop bounds.
+- **No auth gate on this** (see "Open threads" — it was already the top-priority gap for input;
+  this adds live screen contents to what an unauthenticated LAN client can pull).
+
 **Daemon rewritten from Python to Rust** (`src/`). Reason: Python packaging friction
 under Nix (pyautogui pulls Linux-only `scrot`, venv/pyobjc mess). Rust = single binary,
 clean `buildRustPackage`, `nix run` works on darwin + Linux. The PWA (`web/`) and the WS
@@ -147,6 +170,16 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   argv is untested, and hypridle only honours logind inhibitors when
   `ignore_dbus_inhibit=false` (its default). `wlinhibit` is the no-logind fallback and is the
   one path with no pid leash, so it leans on the SIGTERM handler alone.
+- **Touchpad capture (`src/capture.rs`) is entirely unverified on real hardware** — built and
+  argv-checked from a cloud session with no display. On macOS, `screencapture` needs Screen
+  Recording permission granted to the launching terminal (separate from the Accessibility grant
+  input already needs) — untested whether it fails loud or silently without it. On Linux,
+  confirm `grim` actually captures under Hyprland from this daemon (not just from a terminal)
+  and that `-g` geometry syntax is still correct for the installed grim version. Also unverified:
+  whether 8fps/480×300 is remotely the right tradeoff for real Wi-Fi + a real screenshot's
+  actual latency — CAPTURE_INTERVAL and the crop size are guesses, not measurements.
+- Screen capture currently ships with **no auth**, same LAN-exposure gap as input (see the
+  security item above) — now covering live screen contents too, not just injection.
 
 ## Voice commands + command table (as built)
 

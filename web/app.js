@@ -23,7 +23,7 @@ import {
   const ACTIVE_KEY = "remoat.active";
 
   const $ = (id) => document.getElementById(id);
-  const pad = $("pad"), statusDot = $("status"), toast = $("toast");
+  const pad = $("pad"), padcap = $("padcap"), statusDot = $("status"), toast = $("toast");
   const devBtn = $("devbtn"), devName = $("devname"), panel = $("arrange"), stage = $("stage");
 
   // ---- device pool ----
@@ -73,6 +73,7 @@ import {
     let opened = false;
     let ws;
     try { ws = new WebSocket(wsUrl(d)); } catch (_) { setStatus(d, "untrusted"); return; }
+    ws.binaryType = "arraybuffer";   // capture frames arrive as binary PNG, not JSON
     d.ws = ws;
 
     ws.onopen = () => {
@@ -82,6 +83,7 @@ import {
       if (d.id === activeId) sendWake();
     };
     ws.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) { onFrame(d, e.data); return; }
       let m; try { m = JSON.parse(e.data); } catch (_) { return; }
       onMessage(d, m);
     };
@@ -160,6 +162,12 @@ import {
     // auto-lock, and the one you left should be allowed to.
     if (prev) sendTo(prev, { type: "wake", on: false });
     sendWake();
+    // Capture follows it too — a crossing mid-drag must keep streaming from the new device.
+    if (capturing) {
+      if (prev) sendTo(prev, { type: "capture", on: false });
+      sendTo(id, { type: "capture", on: true });
+    }
+    padcap.classList.remove("show");   // last frame belonged to the device we just left
     const d = devices.get(id);
     setStatus(d, d.status || "connecting");
     if (!quiet) showToast(`→ ${d.name}`);
@@ -178,16 +186,19 @@ import {
       const l = localOf(rects(), id, cursor.gx, cursor.gy);
       sendTo(id, { type: "move_abs", x: l.x, y: l.y, home: true });
     }
-    updatePadSpot();
   }
 
-  // ---- touchpad background: a soft glow at the cursor's actual position on its screen, so the
-  // pad gives a spatial sense of where the pointer is without looking up at the desktop.
-  function updatePadSpot() {
-    const r = cursor && rectOf(cursor.id);
-    const l = r ? localOf(rects(), cursor.id, cursor.gx, cursor.gy) : null;
-    pad.style.setProperty("--cx", l ? `${(l.x / r.w) * 100}%` : "50%");
-    pad.style.setProperty("--cy", l ? `${(l.y / r.h) * 100}%` : "50%");
+  // ---- touchpad background: live crop of the desktop around the cursor, sent by the daemon
+  // as PNG frames while dragging (see capture.rs / the "capture" WS message).
+  let padcapUrl = null;
+
+  function onFrame(d, buf) {
+    if (d.id !== activeId) return; // only the device we're actually driving belongs on screen
+    const url = URL.createObjectURL(new Blob([buf], { type: "image/png" }));
+    padcap.src = url;
+    padcap.classList.add("show");
+    if (padcapUrl) URL.revokeObjectURL(padcapUrl);
+    padcapUrl = url;
   }
 
   // ---- toast ----
@@ -212,7 +223,6 @@ import {
     const d = active();
     devName.textContent = d ? d.name : "connecting…";
     statusDot.className = "dot" + (d && d.status === "connected" ? " on" : "");
-    updatePadSpot();
     if (panel.hidden) return;
 
     const rs = rects();
@@ -322,6 +332,7 @@ import {
   let lastX = 0, lastY = 0, startX = 0, startY = 0, startT = 0;
   let maxTouches = 0, moved = false, pendDx = 0, pendDy = 0, scrollAccX = 0, scrollAccY = 0, rafPending = false;
   let blockedAt = 0;
+  let capturing = false;   // requesting live capture frames from the active device while dragging
 
   function flush() {
     rafPending = false;
@@ -361,7 +372,6 @@ import {
       setActive(step.state.id, { keepCursor: true });
     }
     if (step.send) sendTo(step.send.id, { type: "move_abs", ...step.send });
-    updatePadSpot();
   }
 
   pad.addEventListener("touchstart", (e) => {
@@ -371,6 +381,8 @@ import {
     lastX = startX = t.clientX; lastY = startY = t.clientY;
     startT = e.timeStamp; moved = false;
     maxTouches = e.touches.length;
+    capturing = true;
+    sendActive({ type: "capture", on: true });
   }, { passive: false });
 
   pad.addEventListener("touchmove", (e) => {
@@ -394,6 +406,8 @@ import {
       sendActive({ type: "click", button: maxTouches >= 2 ? "right" : "left" });
     }
     maxTouches = 0;
+    capturing = false;
+    sendActive({ type: "capture", on: false });
   }, { passive: false });
 
   // ---- scroll bars (right = vertical, bottom = horizontal) ----
