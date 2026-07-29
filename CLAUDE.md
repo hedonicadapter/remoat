@@ -119,6 +119,26 @@ real cursor. Two different bugs:
 - **The lag fix is measured, not assumed:** with a stand-in `grim` sleeping 600ms (5×
   `CAPTURE_INTERVAL`), 12 pings interleaved with capture-triggering `move_abs` all answered in
   ≤2ms while frames still arrived. Inline-awaited, they'd have queued ~600ms behind it.
+- **After the geometry fix the crop moved to the RIGHT of the cursor — that one is not geometry,
+  it's the modelled pointer position, and flat accel is a hard requirement, not a preference.**
+  The crop is centered on where the daemon *believes* the pointer is, and on Linux that is only
+  ever an estimate (nothing can read the pointer on Wayland; ydotool can't place it absolutely).
+  Worked example on a 3840x1080 desktop: the first `placeCursor` centres at local (1920,540)
+  with `home:true`, `home_corner` slams to (3839,1079), then walks `dx = -1919`. libinput's
+  default *adaptive* profile amplifies a delta that large, so the real pointer travels further
+  left than 1919 and ends up left of the believed 1920 — putting the crop to its right, by
+  roughly the amplification × the walk (hundreds of px). Direction flipped from the earlier
+  black-bar report because that one was inflated bounds, this one is drift.
+  **Homing does not fix this** — the slam pins the pointer, but the walk away from the corner is
+  accelerated too, so the error is reintroduced immediately. The ONLY in-design resync is a
+  screen edge (compositor clamping), which is exactly why `abs_to_rel` overshoots edge targets.
+  So with relative injection there is no way to be accurate mid-screen while accel is on:
+  `accel-profile "flat"` + `accel-speed 0.0` makes deltas 1:1 and the model exact. The ydotool
+  backend now says so at startup. Also worth knowing: **touching the real mouse desynchronises
+  the model permanently** (nothing reports it), until the next `home` or edge contact.
+- `grim -c` / `screencapture -C` draw the real cursor into the crop. Deliberate: while the
+  position is an estimate, seeing the cursor makes an error self-evident instead of looking like
+  the wrong region — and a centred cursor is the cheap confirmation that the estimate is exact.
 - **No auth gate on this** (see "Open threads" — it was already the top-priority gap for input;
   this adds live screen contents to what an unauthenticated LAN client can pull).
 
@@ -195,10 +215,21 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   unit-tested (`input.rs::keyargs`), the *bindings* aren't.
 - PWA settings screen that edits `commands.toml` over WS (`{type:"config_set",…}`) — the
   file format is ready for it; the WS message is not implemented.
-- Exact pointer tracking on Linux needs a real absolute device: either remoat creating its own
-  uinput device WITH an ABS range (needs `/dev/uinput` access, like ydotool's group) or the
-  `wlr-virtual-pointer` protocol's `motion_absolute` — niri support unverified. Either removes
-  the acceleration drift and the corner-homing slam entirely.
+- **Exact pointer tracking on Linux needs a real absolute device — now the top functional gap,
+  because the touchpad capture makes the drift plainly visible** (it was previously only a
+  crossing-reliability concern). Until it lands, Linux users need flat pointer accel; see the
+  worked example under "Touchpad live capture" for why nothing else in this design can be exact.
+  Two candidate mechanisms, neither verified:
+  - **Own uinput device WITH an ABS range** (`UI_ABS_SETUP` — the call ydotool never makes).
+    Needs `/dev/uinput`, i.e. the same group `programs.ydotool.enable` already grants. udev's
+    `input_id` classifies ABS_X/ABS_Y + a mouse button as a *mouse*, and libinput does support
+    absolute pointers (it is how a QEMU `usb-tablet` gives a 1:1 cursor), so this is well
+    trodden — but unknown how niri maps an absolute device across a multi-output layout; if it
+    maps to one output, expect a whole-monitor offset rather than a fix.
+  - **`wlr-virtual-pointer`'s `motion_absolute`** — no uinput permissions needed, but niri's
+    support for `zwlr_virtual_pointer_v1` is unconfirmed; probe for the global before building
+    on it.
+  Either removes the acceleration drift, the corner-homing slam, and the real-mouse desync.
 - Arrangement gaps worth knowing: bounds are ONE rect per device starting at 0,0 — on mac
   that's the main display only (enigo has no virtual-desktop query), so a second monitor on a
   mac isn't reachable by crossing. Linux unions its monitors via hyprctl/wlr-randr, so it is.

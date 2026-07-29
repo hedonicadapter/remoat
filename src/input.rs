@@ -216,6 +216,18 @@ struct YdotoolBackend {
 
 impl YdotoolBackend {
     fn new(dryrun: bool, bounds: Bounds) -> Self {
+        // Not a style preference — a correctness requirement of this backend. See move_abs:
+        // the pointer position is modelled, never read, and libinput's default adaptive accel
+        // profile makes a commanded delta of N move some other number of pixels. Homing does
+        // not rescue it (the walk away from the corner is accelerated too), so the model drifts
+        // from the real pointer everywhere except at a screen edge. Flat accel makes deltas 1:1
+        // and the model exact — which is also what makes the capture crop land on the cursor.
+        eprintln!(
+            "[input] ydotool positions the pointer by relative deltas — for it to be accurate \
+             your compositor needs flat pointer acceleration (niri: input {{ mouse {{ \
+             accel-profile \"flat\"; accel-speed 0.0; }} }}), or the cursor and the touchpad \
+             capture will drift apart"
+        );
         YdotoolBackend { dryrun, bounds, pos: None }
     }
 

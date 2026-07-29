@@ -74,12 +74,13 @@ pub fn capture_around(cx: i32, cy: i32, layout: &Layout, dryrun: bool) -> Option
 fn platform_capture(r: Rect, dryrun: bool) -> Option<Vec<u8>> {
     let path = std::env::temp_dir().join(format!("remoat-cap-{}.png", std::process::id()));
     let region = format!("{},{},{},{}", r.x, r.y, r.w, r.h);
+    // -C draws the cursor in, same reason as grim's -c below.
     if dryrun {
-        println!("[dryrun] screencapture -x -t png -R{region} {}", path.display());
+        println!("[dryrun] screencapture -x -C -t png -R{region} {}", path.display());
         return None;
     }
     let ok = Command::new("screencapture")
-        .args(["-x", "-t", "png", &format!("-R{region}")])
+        .args(["-x", "-C", "-t", "png", &format!("-R{region}")])
         .arg(&path)
         .status()
         .map(|s| s.success())
@@ -92,14 +93,25 @@ fn platform_capture(r: Rect, dryrun: bool) -> Option<Vec<u8>> {
     bytes
 }
 
+/// `-c` draws the real cursor into the capture. That is not cosmetic: on Linux the daemon can
+/// only *estimate* where the pointer is (see input.rs — no absolute injection, no way to read
+/// the pointer on Wayland), so the crop is centered on an estimate. Rendering the cursor makes
+/// any error visible and self-explanatory instead of looking like the wrong region, and when
+/// the estimate is exact the cursor sits dead centre — which doubles as the check that it is.
+/// Split from the call so the argv is testable, same reason as `input.rs::keyargs`.
+#[cfg(not(target_os = "macos"))]
+fn grim_args(r: Rect) -> Vec<String> {
+    vec!["-c".into(), "-g".into(), format!("{},{} {}x{}", r.x, r.y, r.w, r.h), "-".into()]
+}
+
 #[cfg(not(target_os = "macos"))]
 fn platform_capture(r: Rect, dryrun: bool) -> Option<Vec<u8>> {
-    let geom = format!("{},{} {}x{}", r.x, r.y, r.w, r.h);
+    let args = grim_args(r);
     if dryrun {
-        println!("[dryrun] grim -g \"{geom}\" -");
+        println!("[dryrun] grim {}", args.join(" "));
         return None;
     }
-    let out = Command::new("grim").args(["-g", &geom, "-"]).output().ok()?;
+    let out = Command::new("grim").args(&args).output().ok()?;
     if !out.status.success() || out.stdout.is_empty() {
         return None;
     }
@@ -153,6 +165,15 @@ mod tests {
         let r = region_around(1900, 1000, (480, 300), &l);
         assert_eq!(r, rect(1440, 780, 480, 300), "crop escaped the left monitor");
         assert!(r.x + r.w <= 1920 && r.y + r.h <= 1080);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn grim_is_asked_for_the_cursor_and_the_exact_region() {
+        assert_eq!(
+            grim_args(rect(1440, 780, 480, 300)),
+            vec!["-c", "-g", "1440,780 480x300", "-"]
+        );
     }
 
     #[test]
