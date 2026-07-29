@@ -80,23 +80,37 @@ fn screen_frame(st: &AppState) -> String {
     .to_string()
 }
 
-async fn handle_socket(mut socket: WebSocket, st: AppState) {
+async fn handle_socket(socket: WebSocket, st: AppState) {
+    // Split so a slow capture (a subprocess screenshot can take well over one frame) never
+    // blocks the receive loop below it — otherwise every touchmove queued behind an in-flight
+    // capture would stall the cursor itself, not just the image. The sink is shared because
+    // both the loop (JSON replies) and detached capture tasks (binary frames) write to it.
+    use futures_util::{SinkExt, StreamExt};
+    let (sink, mut stream) = socket.split();
+    let sink = Arc::new(tokio::sync::Mutex::new(sink));
+
     // Identify ourselves BEFORE the peer list: the app keys devices by name, so it has to
     // learn who this connection is before the same daemon shows up in `devices` — otherwise
     // it can't tell that entry is us and opens a second socket to itself.
-    let _ = socket.send(Message::Text(screen_frame(&st))).await;
-    let _ = socket
-        .send(Message::Text(json!({"type":"devices","devices": st.disc.devices()}).to_string()))
-        .await;
+    {
+        let mut s = sink.lock().await;
+        let _ = s.send(Message::Text(screen_frame(&st))).await;
+        let _ = s
+            .send(Message::Text(json!({"type":"devices","devices": st.disc.devices()}).to_string()))
+            .await;
+    }
 
     // At most one wake reference per connection, released on blur, idle, or disconnect.
     let mut holding = false;
     // Capture streaming: on only while this client is actively dragging (see "capture" below).
     let mut capturing = false;
     let mut last_capture: Option<std::time::Instant> = None;
+    // Guards against piling up captures if a screenshot takes longer than CAPTURE_INTERVAL —
+    // without it, a slow `grim`/`screencapture` would spawn a growing queue of subprocesses.
+    let capture_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
-        let msg = match tokio::time::timeout(WAKE_IDLE, socket.recv()).await {
+        let msg = match tokio::time::timeout(WAKE_IDLE, stream.next()).await {
             Ok(Some(Ok(m))) => m,
             Ok(_) => break, // closed or errored
             Err(_) => {
@@ -138,19 +152,27 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
 
                 // Piggyback the capture frame on the move itself — the crop is centered on
                 // exactly this position, and the drag already produces these messages at a
-                // steady rate, so there's no separate timer to drift out of sync.
-                if capturing && last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true) {
+                // steady rate, so there's no separate timer to drift out of sync. Spawned
+                // detached (not awaited here) so a slow screenshot never delays the NEXT
+                // move_abs from reaching the input worker.
+                let due = last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true);
+                if capturing && due && !capture_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     last_capture = Some(std::time::Instant::now());
                     let bounds = st.screen;
                     let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
-                    let frame = tokio::task::spawn_blocking(move || {
-                        capture::capture_around(x, y, bounds, dryrun)
-                    })
-                    .await
-                    .unwrap_or(None);
-                    if let Some(bytes) = frame {
-                        let _ = socket.send(Message::Binary(bytes)).await;
-                    }
+                    let sink = sink.clone();
+                    let busy = capture_busy.clone();
+                    tokio::spawn(async move {
+                        let frame = tokio::task::spawn_blocking(move || {
+                            capture::capture_around(x, y, bounds, dryrun)
+                        })
+                        .await
+                        .unwrap_or(None);
+                        busy.store(false, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(bytes) = frame {
+                            let _ = sink.lock().await.send(Message::Binary(bytes)).await;
+                        }
+                    });
                 }
             }
             "click" => {
@@ -215,7 +237,9 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                 } else {
                     res.message.clone().unwrap_or_else(|| "nothing to do".into())
                 };
-                let _ = socket
+                let _ = sink
+                    .lock()
+                    .await
                     .send(Message::Text(
                         json!({"type":"command_result","ok":ok,"label":res.label,"kind":kind,
                                "steps":inputs + launches,"message":message})
@@ -236,7 +260,9 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                     st.wake.release();
                     holding = false;
                 }
-                let _ = socket
+                let _ = sink
+                    .lock()
+                    .await
                     .send(Message::Text(
                         json!({"type":"wake_state","held":holding,"available":st.wake.available(),
                                "clients":st.wake.holders()})
@@ -251,13 +277,14 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
                 capturing = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
             }
             "hello" => {
-                let _ = socket.send(Message::Text(screen_frame(&st))).await;
-                let _ = socket
+                let mut s = sink.lock().await;
+                let _ = s.send(Message::Text(screen_frame(&st))).await;
+                let _ = s
                     .send(Message::Text(json!({"type":"devices","devices": st.disc.devices()}).to_string()))
                     .await;
             }
             "ping" => {
-                let _ = socket.send(Message::Text(json!({"type":"pong"}).to_string())).await;
+                let _ = sink.lock().await.send(Message::Text(json!({"type":"pong"}).to_string())).await;
             }
             _ => {}
         }

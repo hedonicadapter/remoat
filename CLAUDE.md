@@ -77,6 +77,28 @@ someone confirms it on hardware.
   lock (`setActive` in `app.js`).
 - Crop size defaults to 480×300, overridable with `REMOAT_CAPTURE_SIZE=WxH` (mirrors
   `REMOAT_SCREEN`). Region math shrinks-and-clamps to fit inside the actual desktop bounds.
+
+First real-hardware feedback (nixos): laggy, and the crop was offset well to the left of the
+real cursor. Two different bugs:
+- **The lag was real and is fixed.** The first cut awaited the capture subprocess *inline* in
+  the same per-connection loop that also reads incoming WS messages — so every touchmove sent
+  while a screenshot was mid-flight queued behind it, stalling cursor movement itself, not just
+  the image. Fixed by splitting the socket (`futures_util::StreamExt/SinkExt`) into a shared
+  `Arc<Mutex<SplitSink>>` and a receive-only stream; `move_abs` now `tokio::spawn`s the capture
+  detached and sends the frame whenever it's ready, gated by an `AtomicBool` so a slow capture
+  can't pile up a queue of overlapping subprocesses. The receive loop never waits on it.
+- **The offset is still open — root cause unconfirmed.** Leading theory: Hyprland positions
+  monitors in *physical* pixels (`hyprctl monitors -j`'s x/y/width/height, matching how
+  `screen.rs` already reads them), but grim's `-g` geometry — inherited from `slurp`, meant for
+  `wl_output`/xdg-output — is generally understood to want *logical* (post-scale) coordinates.
+  On an unscaled display the two coincide and nothing would look wrong; on a scaled one
+  (fractional or 2x, common on a Linux desktop) they don't, which would produce exactly a
+  fixed-direction offset. Second, weaker theory: the already-documented ydotool relative-motion
+  drift (see "Multi-device arrangement" above) — the crop is centered on the daemon's *believed*
+  position, which can differ from the real one. Distinguishing test: if the offset is present
+  immediately after connecting (before any dragging), it's the scale theory; if it's absent
+  right after crossing an edge (a `home` resync) and grows the further you drag from there, it's
+  drift. Whoever picks this up next: get `hyprctl monitors -j`'s `"scale"` field first.
 - **No auth gate on this** (see "Open threads" — it was already the top-priority gap for input;
   this adds live screen contents to what an unauthenticated LAN client can pull).
 
