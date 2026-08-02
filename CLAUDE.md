@@ -204,9 +204,10 @@ fake audio device feeding a wav into `getUserMedia`: the button subtitle flipped
 no-model path was checked the same way — subtitle stays "dictation", buttons stay enabled, no
 page errors — so a daemon without a model still dictates via Web Speech.
 
-**Not verified on an actual iPhone.** Everything above is Chromium with a fake audio device.
-iOS Safari is the real target and has its own AudioWorklet/getUserMedia behaviour (context
-suspension, forced sample rates, standalone-PWA quirks). Treat the phone side as unexercised.
+**Loosely confirmed on a real iPhone and the nixos box by the user** (2026-08-02) — dictation
+works. Not systematically exercised, so iOS Safari edge cases (context suspension on
+backgrounding, forced sample rates, standalone-PWA quirks) are still unproven rather than
+known-broken.
 
 **Daemon rewritten from Python to Rust** (`src/`). Reason: Python packaging friction
 under Nix (pyautogui pulls Linux-only `scrot`, venv/pyobjc mess). Rust = single binary,
@@ -271,9 +272,33 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
 
 ## Open threads / next steps
 
-- **Security (top priority, raised by user):** no auth — anyone on the LAN can drive the
-  machine. Add a shared-token/pairing check. (Port 8443 itself is fine; TLS is on but
-  self-signed.)
+- **AUTH — top priority, and the gap widened.** There is no authentication of any kind:
+  anyone who can reach the port can inject input, read live screen crops, and drive dictation.
+  mDNS advertises the daemon, so they don't even have to look for it. TLS is on but
+  self-signed, so it gives confidentiality, not identity. Port 8443 itself is fine.
+  Design sketch: random 256-bit token per daemon in `$XDG_STATE_HOME/remoat` (next to the
+  certs), shown as a short pairing code at startup; phone stores it in `localStorage` beside
+  the layout. Gotchas found while building the rest of this — worth reading before starting:
+  - **Browsers cannot set headers on a WebSocket.** So no `Authorization`. Don't put the token
+    in the query string either (it lands in logs and history). Do a first-message handshake:
+    accept the socket, then ignore every frame until a valid `{type:"auth",token}` arrives,
+    with a short timeout and a close on failure.
+  - **`screen` and `devices` are currently sent BEFORE the client says anything** (handshake
+    order matters to the app — see `handle_socket`). They leak hostname and resolution to an
+    unauthenticated peer, so they have to move after auth *without* breaking the ordering the
+    client depends on.
+  - **Gate every path, not just input.** `capture` (live screen), `stt_start` + binary audio,
+    and `wake` are all separately reachable today.
+  - **One token per daemon, and the phone holds sockets to ALL of them** (edge crossing needs
+    them open). So pairing is per-device and the arrangement UI already has the right place to
+    hang it: the tile's existing `untrusted` state, which currently only means "cert not
+    accepted" and would gain a second meaning.
+  - **The cert exception flow already sends users to each peer's page once.** Pairing can ride
+    along with that rather than inventing a second ceremony.
+  - Constant-time compare; rate-limit failures; and a token that never appears in a toast,
+    a log line, or the `devices` frame.
+  - Local STT means audio no longer leaves the LAN — but an unauthenticated peer can still
+    *inject* text through the same path, so it is not a mitigation.
 - Wire the LLM/MCP command fallback (`src/commands.rs:llm_fallback`). The tool schema's
   action parameter should be `enum: actions::NAMES` + an integer count, so the model can
   emit nothing the deterministic tier couldn't.
@@ -298,8 +323,12 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   file format is ready for it; the WS message is not implemented.
 - **Exact pointer tracking on Linux needs a real absolute device — now the top functional gap,
   because the touchpad capture makes the drift plainly visible** (it was previously only a
-  crossing-reliability concern). Until it lands, Linux users need flat pointer accel; see the
-  worked example under "Touchpad live capture" for why nothing else in this design can be exact.
+  crossing-reliability concern). **Flat pointer accel is explicitly rejected as the answer** —
+  the user's position, and the right one: a remote-control daemon that only works if you
+  reconfigure your compositor is broken by design, not configurable. Treat flat accel as a
+  diagnostic for confirming the cause, never as the fix. See the worked example under
+  "Touchpad live capture" for why nothing else *in the current design* can be exact — the
+  design has to change.
   Two candidate mechanisms, neither verified:
   - **Own uinput device WITH an ABS range** (`UI_ABS_SETUP` — the call ydotool never makes).
     Needs `/dev/uinput`, i.e. the same group `programs.ydotool.enable` already grants. udev's
