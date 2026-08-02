@@ -5,7 +5,7 @@ buttons: dictation + NL commands) ↔ desktop daemon that injects input. Targets
 and Linux (incl. Hyprland/Wayland). This file is the handoff so a fresh session (e.g.
 cloud) has full context. Read the README too.
 
-## Current status (2026-07-27)
+## Current status (2026-08-02)
 
 **Voice commands + configurable command table are BUILT** (was the design section below).
 `src/voice.rs` (normalize/count/chain), `src/actions.rs` (the allowlist), `src/config.rs`
@@ -200,7 +200,13 @@ streaming in 100ms chunks, partials confirmed to arrive before 50% of the audio,
 exercising the resampler). Then end-to-end over real WS/TLS: injected fragments reassemble
 *exactly* to the transcript with **zero backspaces**. Then the real PWA in real Chromium with a
 fake audio device feeding a wav into `getUserMedia`: the button subtitle flipped to
-"dictation · on-device" and the label showed a live growing transcript while held.
+"dictation · on-device" and the label showed a live growing transcript while held. The
+no-model path was checked the same way — subtitle stays "dictation", buttons stay enabled, no
+page errors — so a daemon without a model still dictates via Web Speech.
+
+**Not verified on an actual iPhone.** Everything above is Chromium with a fake audio device.
+iOS Safari is the real target and has its own AudioWorklet/getUserMedia behaviour (context
+suspension, forced sample rates, standalone-PWA quirks). Treat the phone side as unexercised.
 
 **Daemon rewritten from Python to Rust** (`src/`). Reason: Python packaging friction
 under Nix (pyautogui pulls Linux-only `scrot`, venv/pyobjc mess). Rust = single binary,
