@@ -364,6 +364,44 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
 - Screen capture currently ships with **no auth**, same LAN-exposure gap as input (see the
   security item above) — now covering live screen contents too, not just injection.
 
+**Dynamic command tier BUILT** (`src/apps.rs`, `src/wm.rs`, `src/dynamic.rs`) — commands whose
+*object* only exists at runtime: the windows you have open, the apps you have installed.
+```
+utterance → static table → DYNAMIC TIER → llm_fallback
+```
+- **`apps.rs`** reads the OS's own answer to "what can I launch": XDG desktop entries on Linux
+  (including `/run/current-system/sw/share/applications`, where nix-declared apps land) and
+  `.app` bundles on macOS. This is the "generate commands from my config" idea done against the
+  *evaluated* result — parsing nix source would mean `nix eval` on a Turing-complete language,
+  while desktop entries are the same information already evaluated and portable.
+- **`wm.rs`** is one `Wm` trait with per-compositor backends: `niri msg --json` and
+  `omniwmctl query windows --json`. Chosen over the portable
+  `wlr-foreign-toplevel-management-v1` (which ~20 compositors implement) because that protocol
+  has **no concept of a workspace**, and workspaces are half of "control my desktop". The
+  portable protocol is the long-tail fallback and slots in as another backend.
+- **Detection probes CAPABILITY, never the compositor's name.** "Can I list windows?", not
+  "am I on niri?". A missing backend disables only window/workspace commands; apps still work.
+- **omniwm ships with IPC disabled by default**, so a failing probe says *"is IPC enabled in
+  OmniWM's settings?"* rather than nothing — the `wlr-randr` lesson, applied preemptively.
+- **Window ids are never cached.** omniwm's are session-scoped and go stale on restart, so a
+  name resolves to an id at the moment you speak. `wm::windows()` has only a 750ms cache so one
+  utterance doesn't round-trip the compositor twice.
+- **Matching is fuzzy** (`dynamic::score`) because the input is a speech transcript: lowercase,
+  unpunctuated, prone to mangling proper nouns. Exact matching against a window title would
+  essentially never fire. Two near-equal candidates are REFUSED rather than coin-flipped —
+  acting on the wrong window is worse than falling through.
+- **Resolution stays side-effect free**, so `remoat --check "focus slack"` prints
+  `run niri msg action focus-window --id 7` without doing it. New `Exec::Run` waits for exit
+  status (unlike `Exec::Launch`, which spawns and forgets) because for WM IPC whether it
+  *worked* is the whole point of the toast.
+
+Verified with stand-in `niri`/`omniwmctl` binaries and a fixture desktop-entry dir: both
+backends resolve focus/workspace correctly, IPC-disabled and no-WM-at-all both degrade with the
+right message, and 27 unit tests cover the parsers and the matcher. Caught end-to-end and fixed:
+`Exec=spotify --uri=%U` was passing the field code through, which would have made the app open a
+file named `%U`. **The omniwm backend is written from its published IPC docs, not run against a
+live daemon** — treat it as unexercised until someone tries it on the Mac.
+
 ## Voice commands + command table (as built)
 
 ```

@@ -20,16 +20,19 @@
 //! `text` message stays for clients without a local model, which still use Web Speech.
 
 mod actions;
+mod apps;
 mod capture;
 mod commands;
 mod config;
 mod discovery;
+mod dynamic;
 mod input;
 mod screen;
 mod stt;
 mod tls;
 mod voice;
 mod wake;
+mod wm;
 
 use std::net::SocketAddr;
 
@@ -169,6 +172,10 @@ async fn run_command(st: &AppState, sink: &Sink, t: &str) {
                 inputs += 1;
             }
             Exec::Launch(argv) => match commands::execute_launch(&argv) {
+                Ok(_) => launches += 1,
+                Err(e) => errors.push(e),
+            },
+            Exec::Run(argv) => match commands::execute_run(&argv) {
                 Ok(_) => launches += 1,
                 Err(e) => errors.push(e),
             },
@@ -497,6 +504,7 @@ fn check(phrase: &str) {
         match step {
             Exec::Input(c) => println!("  input   {c:?}"),
             Exec::Launch(a) => println!("  launch  {}", a.join(" ")),
+            Exec::Run(a) => println!("  run     {}", a.join(" ")),
             Exec::Note(n) => println!("  note    {n}"),
         }
     }

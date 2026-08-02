@@ -18,7 +18,11 @@ use crate::voice;
 /// isn't wired for this platform).
 pub enum Exec {
     Input(InputCmd),
+    /// Spawn and forget — an application, which keeps running after we stop caring.
     Launch(Vec<String>),
+    /// Run to completion and report the exit status. Window-manager IPC is fast and local, and
+    /// unlike launching an app whether it *worked* is the whole point of the toast.
+    Run(Vec<String>),
     Note(String),
 }
 
@@ -45,11 +49,16 @@ pub fn route(text: &str) -> Resolution {
     if let Some(plan) = resolve_step(&rules, &q) {
         return finish(vec![plan]);
     }
+    // Then the dynamic tier: "open <app>", "focus <window>", "workspace <n>" — objects that
+    // only exist at runtime. After the table, so a user rule still overrides them.
+    if let Some(plan) = dynamic_step(&q) {
+        return finish(vec![plan]);
+    }
     let segs = voice::split_steps(&q);
     if segs.len() > 1 {
         let mut plans = Vec::new();
         for s in &segs {
-            match resolve_step(&rules, s) {
+            match resolve_step(&rules, s).or_else(|| dynamic_step(s)) {
                 Some(p) => plans.push(p),
                 None => return llm_fallback(&q, Some(s)),
             }
@@ -62,6 +71,13 @@ pub fn route(text: &str) -> Resolution {
 struct Plan {
     label: String,
     steps: Vec<Exec>,
+}
+
+/// Live-object commands. Reads (window list, installed apps) but never acts, so `--check`
+/// still shows the plan without performing it.
+fn dynamic_step(seg: &str) -> Option<Plan> {
+    let d = crate::dynamic::resolve(seg)?;
+    Some(Plan { label: d.label, steps: d.steps })
 }
 
 /// Match one step against the table. `strip_repeat` runs second so a phrase that legitimately
@@ -182,6 +198,7 @@ fn clone_exec(e: &Exec) -> Exec {
     match e {
         Exec::Input(c) => Exec::Input(c.clone()),
         Exec::Launch(a) => Exec::Launch(a.clone()),
+        Exec::Run(a) => Exec::Run(a.clone()),
         Exec::Note(s) => Exec::Note(s.clone()),
     }
 }
@@ -228,6 +245,23 @@ pub fn execute_launch(argv: &[String]) -> Result<String, String> {
     }
 }
 
+/// Run a command to completion and report whether it worked. Used for window-manager IPC,
+/// where a non-zero exit ("no such window") is the answer the toast needs to carry.
+pub fn execute_run(argv: &[String]) -> Result<String, String> {
+    if argv.is_empty() {
+        return Err("empty argv".into());
+    }
+    match Command::new(&argv[0]).args(&argv[1..]).output() {
+        Ok(o) if o.status.success() => Ok(argv.join(" ")),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let err = err.trim();
+            Err(if err.is_empty() { format!("{} failed", argv[0]) } else { err.to_string() })
+        }
+        Err(e) => Err(format!("{}: {e}", argv[0])),
+    }
+}
+
 /// SEAM: route the long tail via an LLM constrained to the SAME bounded surface.
 /// Send `text` plus a tool schema whose action parameter is `enum: actions::NAMES` (and an
 /// integer count), then map the chosen call back through `actions::action` — so the model
@@ -254,6 +288,7 @@ mod tests {
             .map(|s| match s {
                 Exec::Input(c) => format!("{c:?}"),
                 Exec::Launch(a) => format!("launch {}", a.join(" ")),
+                Exec::Run(a) => format!("run {}", a.join(" ")),
                 Exec::Note(n) => format!("note {n}"),
             })
             .collect();
