@@ -165,9 +165,27 @@ capture feature, this one is **verified end-to-end on real audio through a real 
   miscount and panic on a multi-byte boundary. The `text` message stays for Web Speech clients.
 - **Graceful degradation is the design, not a fallback bolted on.** No model => `screen` frame
   reports `stt:false` => the phone keeps using Web Speech. `remoat --fetch-model` installs it
-  (~122MB download, ~42MB int8 weights) into `$XDG_STATE_HOME/remoat/models`, the same
+  (296MB download, ~71MB int8 weights) into `$XDG_STATE_HOME/remoat/models`, the same
   state-not-store pattern as the TLS certs. Deliberately an explicit command, not a surprise
   first-run download.
+- **The model is chosen by measurement, and the first choice was wrong.** v1 shipped the 20M
+  zipformer to keep the download small; real use was audibly worse, which the bundled reference
+  wavs then confirmed. `REMOAT_BENCH=1 cargo test bench_models -- --nocapture` benchmarks every
+  model under the model root (WER + realtime factor):
+  ```
+  20M-2023-02-17  int8 greedy  7.7% WER  0.051 RTF
+  20M-2023-02-17  int8 beam    6.3%      0.060
+  2023-06-26      int8 beam    0.0%      0.095   <- default
+  2023-06-26      fp32 beam    0.0%      0.137
+  ```
+  Worth keeping: **int8 costs no accuracy here and is 45% faster than fp32** — don't "upgrade"
+  to fp32. **Beam search only helped the small model**, but stays because it is the only mode
+  sherpa applies hotwords in, and RTF ~0.1 leaves a 10x realtime margin either way.
+  Model files are located by PREFIX (`encoder*`/`decoder*`/`joiner*`) since names differ across
+  the zoo, so `REMOAT_STT_MODEL` can point at any streaming transducer, by name or absolute
+  path; `REMOAT_STT_PRECISION=fp32` and `REMOAT_STT_DECODING=greedy_search` are the other knobs.
+  NeMo conformers need `greedy_search` — asking one for beam search **aborts the process** from
+  inside sherpa's C++, which no Rust error handling can catch.
 - **`PAD_SAMPLES` is load-bearing, not defensive.** The streaming encoder needs warm-up frames:
   with no lead-in silence the model **drops the opening words outright** (0s and 0.3s both gave
   "THE YELLOW LAMPS…"; 0.5s gave the correct "AFTER EARLY NIGHTFALL THE YELLOW LAMPS…"). A user
@@ -177,7 +195,7 @@ capture feature, this one is **verified end-to-end on real audio through a real 
   hand-written `FIXUPS`) are plumbed through `start()` but **currently inert**: sherpa only
   applies them under `modified_beam_search`, and we decode greedily for latency. See Open threads.
 
-Verified: 64 unit tests including real decodes of the model's bundled reference wavs (WER < 0.15,
+Verified: 65 unit tests including real decodes of the model's bundled reference wavs (WER < 0.05,
 streaming in 100ms chunks, partials confirmed to arrive before 50% of the audio, and the 8kHz wav
 exercising the resampler). Then end-to-end over real WS/TLS: injected fragments reassemble
 *exactly* to the transcript with **zero backspaces**. Then the real PWA in real Chromium with a

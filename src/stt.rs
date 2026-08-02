@@ -21,19 +21,65 @@ use sherpa_onnx::{
     OnlineTransducerModelConfig,
 };
 
-/// Model the daemon expects, and what `--fetch-model` downloads. 20M-parameter streaming
-/// zipformer, int8: ~42 MB of weights, comfortably realtime on a couple of CPU cores.
-pub const MODEL_NAME: &str = "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17";
+/// Model the daemon expects, and what `--fetch-model` downloads.
+///
+/// Chosen by measurement, not by size (`REMOAT_BENCH=1 cargo test bench_models`, WER over the
+/// bundled reference wavs, RTF = decode time / audio duration on 3 threads):
+///   20M-2023-02-17  int8 greedy  7.7% WER  0.051 RTF
+///   20M-2023-02-17  int8 beam    6.3%      0.060
+///   2023-06-26      int8 beam    0.0%      0.095   <- this one
+///   2023-06-26      fp32 beam    0.0%      0.137
+/// The first cut shipped the 20M model to keep the download small; it was audibly worse in
+/// real use. This one is ~71 MB of int8 weights (296 MB tarball) and still decodes ~10x faster
+/// than realtime, which is what matters for typing while you speak. fp32 buys no accuracy here
+/// and costs 45% more time, so int8 stays the default.
+pub const MODEL_NAME: &str = "sherpa-onnx-streaming-zipformer-en-2023-06-26";
 pub const MODEL_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2";
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2";
 
-/// What the model directory must contain to be usable. int8 chosen over fp32 deliberately:
-/// a quarter the size and faster on CPU, and this is a dictation model, not a transcript
-/// archive — a rare token error costs a backspace, not a corrupted document.
-const ENCODER: &str = "encoder-epoch-99-avg-1.int8.onnx";
-const DECODER: &str = "decoder-epoch-99-avg-1.int8.onnx";
-const JOINER: &str = "joiner-epoch-99-avg-1.int8.onnx";
-const TOKENS: &str = "tokens.txt";
+/// The three ONNX graphs of a transducer plus its token table.
+pub struct ModelFiles {
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub joiner: PathBuf,
+    pub tokens: PathBuf,
+}
+
+/// Locate a streaming transducer's files by PREFIX, not by exact name. Models in the sherpa zoo
+/// disagree wildly — `encoder.onnx` for the NeMo conformers,
+/// `encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx` for the zipformers — and hardcoding one
+/// spelling is what would stop a user from dropping in a better model with REMOAT_STT_MODEL.
+pub fn find_model(dir: &Path, prefer_int8: bool) -> Option<ModelFiles> {
+    let tokens = dir.join("tokens.txt");
+    if !tokens.is_file() {
+        return None;
+    }
+    let entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "onnx"))
+        .collect();
+    let pick = |prefix: &str| -> Option<PathBuf> {
+        let mut c: Vec<&PathBuf> = entries
+            .iter()
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix))
+            })
+            .collect();
+        // Prefer the requested precision, but take whatever exists — the NeMo models ship no
+        // int8 variant at all, and half a model is worse than a slower one.
+        let int8 = |p: &PathBuf| p.to_string_lossy().contains(".int8.");
+        c.sort_by_key(|p| (int8(p) != prefer_int8, p.to_string_lossy().len()));
+        c.first().map(|p| (*p).clone())
+    };
+    Some(ModelFiles {
+        encoder: pick("encoder")?,
+        decoder: pick("decoder")?,
+        joiner: pick("joiner")?,
+        tokens,
+    })
+}
 
 /// Sample rate the model's feature extractor expects.
 pub const MODEL_RATE: i32 = 16000;
@@ -64,13 +110,25 @@ pub fn model_root() -> Option<PathBuf> {
     Some(base.join("remoat").join("models"))
 }
 
+/// Which model to run. `REMOAT_STT_MODEL` takes either a bare name under the model root or an
+/// absolute path, so a better model can be swapped in without touching the code.
 pub fn model_dir() -> Option<PathBuf> {
-    Some(model_root()?.join(MODEL_NAME))
+    match std::env::var("REMOAT_STT_MODEL") {
+        Ok(v) if v.starts_with('/') => Some(PathBuf::from(v)),
+        Ok(v) if !v.is_empty() => Some(model_root()?.join(v)),
+        _ => Some(model_root()?.join(MODEL_NAME)),
+    }
+}
+
+/// int8 by default — a quarter the size and faster on CPU. `REMOAT_STT_PRECISION=fp32` trades
+/// that back for accuracy, which matters more on small models where quantisation bites hardest.
+fn prefer_int8() -> bool {
+    !std::env::var("REMOAT_STT_PRECISION").is_ok_and(|v| v.eq_ignore_ascii_case("fp32"))
 }
 
 /// Every required file present? A half-extracted download must not look installed.
 pub fn model_present(dir: &Path) -> bool {
-    [ENCODER, DECODER, JOINER, TOKENS].iter().all(|f| dir.join(f).is_file())
+    find_model(dir, prefer_int8()).is_some()
 }
 
 pub struct Stt {
@@ -90,19 +148,26 @@ impl Stt {
             );
             return None;
         }
-        let p = |f: &str| dir.join(f).to_string_lossy().into_owned();
+        let f = find_model(&dir, prefer_int8())?;
+        let s = |p: &Path| Some(p.to_string_lossy().into_owned());
+        // modified_beam_search is measurably more accurate than greedy and, on a streaming
+        // transducer, cheap enough to stay realtime — the earlier greedy default was chosen for
+        // latency before that was measured. It is also the only mode sherpa applies hotwords in.
+        let method = std::env::var("REMOAT_STT_DECODING")
+            .unwrap_or_else(|_| "modified_beam_search".into());
         let mut config = OnlineRecognizerConfig {
             model_config: OnlineModelConfig {
                 transducer: OnlineTransducerModelConfig {
-                    encoder: Some(p(ENCODER)),
-                    decoder: Some(p(DECODER)),
-                    joiner: Some(p(JOINER)),
+                    encoder: s(&f.encoder),
+                    decoder: s(&f.decoder),
+                    joiner: s(&f.joiner),
                 },
-                tokens: Some(p(TOKENS)),
+                tokens: s(&f.tokens),
                 num_threads: threads.max(1),
                 ..Default::default()
             },
-            decoding_method: Some("greedy_search".into()),
+            max_active_paths: 4,
+            decoding_method: Some(method),
             ..Default::default()
         };
         // Endpointing is off: push-to-talk already delimits the utterance, and letting the
@@ -368,13 +433,22 @@ mod tests {
     // This is the check the capture feature never had: it exercises the actual engine, not just
     // argv or arithmetic. Run after `remoat --fetch-model`.
 
-    fn engine() -> Option<Stt> {
-        let dir = model_dir()?;
-        if !model_present(&dir) {
-            eprintln!("[test] model not installed — skipping real-decode tests");
-            return None;
-        }
-        Stt::load(2)
+    /// One engine for every real-decode test. Loading a 70MB model per test and running four
+    /// recognizers concurrently on a small box just contends for cores — and ONNX intra-op
+    /// threading can vary reduction order under load, which is exactly the kind of thing that
+    /// makes a WER assertion flaky. `Stt` is Send + Sync, so sharing it is free.
+    fn engine() -> Option<&'static Stt> {
+        static ENGINE: std::sync::OnceLock<Option<Stt>> = std::sync::OnceLock::new();
+        ENGINE
+            .get_or_init(|| {
+                let dir = model_dir()?;
+                if !model_present(&dir) {
+                    eprintln!("[test] model not installed — skipping real-decode tests");
+                    return None;
+                }
+                Stt::load(2)
+            })
+            .as_ref()
     }
 
     /// Word error rate, so the assertion tolerates a token slip without being meaningless.
@@ -414,7 +488,7 @@ mod tests {
             }
             let got = stt.finish(&mut u);
             let rate = wer(reference, &got);
-            assert!(rate < 0.15, "{name}: WER {rate:.2}\n  want: {reference}\n  got:  {got}");
+            assert!(rate < 0.05, "{name}: WER {rate:.2}\n  want: {reference}\n  got:  {got}");
         }
     }
 
@@ -480,6 +554,93 @@ mod tests {
         }
         let got = stt.finish(&mut u);
         let reference = "YET THESE THOUGHTS AFFECTED HESTER PRYNNE LESS WITH HOPE THAN APPREHENSION";
-        assert!(wer(reference, &got) < 0.25, "resampled decode: {got}");
+        assert!(wer(reference, &got) < 0.15, "resampled decode: {got}");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    fn wer2(reference: &str, got: &str) -> f32 {
+        let r: Vec<&str> = reference.split_whitespace().collect();
+        let h: Vec<&str> = got.split_whitespace().collect();
+        let mut prev: Vec<usize> = (0..=h.len()).collect();
+        for (i, rw) in r.iter().enumerate() {
+            let mut cur = vec![i + 1];
+            for (j, hw) in h.iter().enumerate() {
+                let sub = prev[j] + usize::from(rw != hw);
+                cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+            }
+            prev = cur;
+        }
+        prev[h.len()] as f32 / r.len().max(1) as f32
+    }
+
+    const REFS: &[(&str, &str)] = &[
+        ("0.wav", "AFTER EARLY NIGHTFALL THE YELLOW LAMPS WOULD LIGHT UP HERE AND THERE THE SQUALID QUARTER OF THE BROTHELS"),
+        ("1.wav", "GOD AS A DIRECT CONSEQUENCE OF THE SIN WHICH MAN THUS PUNISHED HAD GIVEN HER A LOVELY CHILD WHOSE PLACE WAS ON THAT SAME DISHONOURED BOSOM TO CONNECT HER PARENT FOR EVER WITH THE RACE AND DESCENT OF MORTALS AND TO BE FINALLY A BLESSED SOUL IN HEAVEN"),
+        ("8k.wav", "YET THESE THOUGHTS AFFECTED HESTER PRYNNE LESS WITH HOPE THAN APPREHENSION"),
+    ];
+
+    #[test]
+    fn bench_models() {
+        if std::env::var("REMOAT_BENCH").is_err() { return; }
+        let root = model_root().unwrap();
+        let wavdir = model_root().unwrap().join(MODEL_NAME).join("test_wavs");
+        // Whichever models are installed under the model root, or REMOAT_BENCH_MODELS.
+        let listed = std::env::var("REMOAT_BENCH_MODELS").unwrap_or_default();
+        let models: Vec<String> = if listed.is_empty() {
+            let mut v: Vec<String> = std::fs::read_dir(&root)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            v.sort();
+            v
+        } else {
+            listed.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        println!("\n{:<52} {:>6} {:>10} {:>7} {:>7}", "model", "prec", "decoding", "WER", "RTF");
+        for m in &models {
+            let m = m.as_str();
+            for prec in ["int8", "fp32"] {
+                for dec in ["greedy_search", "modified_beam_search"] {
+                    std::env::set_var("REMOAT_STT_MODEL", m);
+                    std::env::set_var("REMOAT_STT_PRECISION", prec);
+                    std::env::set_var("REMOAT_STT_DECODING", dec);
+                    let dir = root.join(m);
+                    let Some(files) = find_model(&dir, prec == "int8") else { continue };
+                    // Skip a precision the model doesn't actually ship.
+                    let has_int8 = files.encoder.to_string_lossy().contains(".int8.");
+                    if (prec == "int8") != has_int8 { continue; }
+                    // sherpa ABORTS the process (not an Err) if a NeMo transducer is asked
+                    // for modified_beam_search — skip rather than lose the whole benchmark.
+                    if dec == "modified_beam_search" && m.contains("nemo") { continue; }
+                    let Some(stt) = Stt::load(3) else { continue };
+                    let (mut tot_wer, mut n, mut audio_s, mut wall) = (0.0f32, 0, 0.0f64, 0.0f64);
+                    for (w, reference) in REFS {
+                        let Some(wave) = sherpa_onnx::Wave::read(&wavdir.join(w).to_string_lossy()) else { continue };
+                        let t0 = Instant::now();
+                        let mut u = stt.start(wave.sample_rate(), None);
+                        for c in wave.samples().chunks((wave.sample_rate()/10) as usize) { stt.push(&mut u, c); }
+                        let got = stt.finish(&mut u);
+                        wall += t0.elapsed().as_secs_f64();
+                        audio_s += wave.samples().len() as f64 / wave.sample_rate() as f64;
+                        tot_wer += wer2(reference, &got); n += 1;
+                    }
+                    if n > 0 {
+                        println!("{:<52} {:>6} {:>10} {:>6.1}% {:>7.3}",
+                            m.replace("sherpa-onnx-", ""), prec,
+                            if dec.starts_with("greedy") {"greedy"} else {"beam"},
+                            tot_wer/n as f32*100.0, wall/audio_s);
+                    }
+                }
+            }
+        }
+        for v in ["REMOAT_STT_MODEL","REMOAT_STT_PRECISION","REMOAT_STT_DECODING"] { std::env::remove_var(v); }
     }
 }
