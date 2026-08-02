@@ -114,11 +114,17 @@ import {
       d.name = m.name;
       d.platform = m.platform || d.platform;
       d.w = m.w; d.h = m.h;
+      d.stt = !!m.stt;   // daemon has a local model: stream audio instead of Web Speech text
       if (!originId && isOrigin(d)) originId = d.id;
       if (!activeId || !devices.has(activeId)) setActive(d.id, { quiet: true });
       render();
+      updatePttLabels();
     } else if (m.type === "command_result") {
       showToast(m.message || m.label, m.ok ? "ok" : "err");
+    } else if (m.type === "stt_partial") {
+      // The daemon owns the transcript when it does the recognising, so the button label is
+      // echoed back rather than read from a local recognizer.
+      if (d.id === activeId && recBtn) setPttText(recBtn, m.text || "listening…");
     } else if (m.type === "wake_state") onWakeState(m);
   }
 
@@ -456,10 +462,90 @@ import {
     typed = full;
   }
 
+  // ---- local STT: stream mic PCM to the daemon, which recognises and types ----
+  // Preferred over Web Speech whenever the active daemon has a model: it stays on the LAN,
+  // works offline, and the daemon can bias decoding toward the command table. Web Speech
+  // remains the fallback, so a daemon without a model still dictates.
+  let audioCtx = null, micNode = null, micStream = null, streaming = false;
+
+  const localStt = () => { const d = active(); return !!(d && d.stt); };
+
+  async function startAudio(mode) {
+    const d = active();
+    if (!d) return false;
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        await audioCtx.audioWorklet.addModule("/pcm-worklet.js");
+      }
+      // iOS suspends the context unless resumed from a user gesture — this runs in the
+      // pointerdown handler, which is exactly that.
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      if (!micStream) {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        });
+      }
+      sendActive({ type: "stt_start", mode, rate: Math.round(audioCtx.sampleRate) });
+      const src = audioCtx.createMediaStreamSource(micStream);
+      micNode = new AudioWorkletNode(audioCtx, "pcm-worklet");
+      micNode.port.onmessage = (e) => {
+        // Only while held, and only to the device we're actually driving.
+        if (streaming) sendAudio(activeId, e.data);
+      };
+      src.connect(micNode);
+      // Worklets need a sink to be pulled; a zero-gain destination keeps it running silently.
+      const mute = audioCtx.createGain();
+      mute.gain.value = 0;
+      micNode.connect(mute).connect(audioCtx.destination);
+      streaming = true;
+      return true;
+    } catch (e) {
+      showToast("mic: " + (e && e.message ? e.message : e), "err");
+      stopAudio();
+      return false;
+    }
+  }
+
+  function stopAudio() {
+    streaming = false;
+    if (micNode) { try { micNode.disconnect(); micNode.port.onmessage = null; } catch (_) {} micNode = null; }
+    // The MediaStream is deliberately kept open between presses: re-acquiring it per press
+    // costs a permission round-trip on iOS and adds latency to the first word.
+  }
+
+  // `send` only stringifies objects; audio is already an ArrayBuffer and goes as a binary frame.
+  function sendAudio(id, buf) {
+    const d = devices.get(id);
+    if (d && d.ws && d.ws.readyState === 1) d.ws.send(buf);
+  }
+
+  const setPttText = (btn, s) => { btn.querySelector(".lbl").textContent = s; };
+  let recBtn = null;   // the button currently held, so stt_partial knows what to relabel
+
+  function updatePttLabels() {
+    const local = localStt();
+    for (const b of [typeBtn, cmdBtn]) {
+      if (!b || b.classList.contains("rec")) continue;
+      b.disabled = !local && !SR;
+    }
+    if (typeBtn) typeBtn.querySelector(".sub").textContent = local ? "dictation · on-device" : (SR ? "dictation" : "voice unsupported");
+    if (cmdBtn) cmdBtn.querySelector(".sub").textContent = local ? "\"open browser\" · on-device" : (SR ? "\"open browser\"" : "voice unsupported");
+  }
+
   function initPTT(btn, mode) {
-    if (!SR) { btn.disabled = true; btn.querySelector(".sub").textContent = "voice unsupported"; return; }
     const start = (ev) => {
       ev.preventDefault();
+      // Local STT takes priority when the active daemon offers it.
+      if (localStt()) {
+        if (streaming) return;
+        recBtn = btn;
+        btn.classList.add("rec");
+        setPttText(btn, "listening…");
+        startAudio(mode).then((ok) => { if (!ok) { btn.classList.remove("rec"); setPttText(btn, btn.dataset.label); recBtn = null; } });
+        return;
+      }
+      if (!SR) { showToast("no local model and no browser speech support", "err"); return; }
       if (rec) return;
       transcript = ""; typed = ""; recMode = mode;
       rec = new SR();
@@ -477,7 +563,18 @@ import {
       try { rec.start(); btn.classList.add("rec"); btn.querySelector(".lbl").textContent = "listening…"; }
       catch (_) { rec = null; }
     };
-    const stop = (ev) => { ev.preventDefault(); if (rec) try { rec.stop(); } catch (_) {} };
+    const stop = (ev) => {
+      ev.preventDefault();
+      if (streaming) {
+        stopAudio();
+        sendActive({ type: "stt_stop" });   // daemon flushes the tail and finalises
+        btn.classList.remove("rec");
+        setPttText(btn, btn.dataset.label);
+        recBtn = null;
+        return;
+      }
+      if (rec) try { rec.stop(); } catch (_) {}
+    };
     btn.addEventListener("pointerdown", start);
     btn.addEventListener("pointerup", stop);
     btn.addEventListener("pointerleave", stop);
@@ -499,6 +596,7 @@ import {
   cmdBtn.dataset.label = "Hold to command";
   initPTT(typeBtn, "type");
   initPTT(cmdBtn, "command");
+  updatePttLabels();   // reflects "on-device" once a daemon reports a model
 
   // Bootstrap: the serving daemon. It reports itself plus every peer it can see over mDNS,
   // and each of those gets its own socket from mergeDevices().

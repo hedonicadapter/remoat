@@ -2,12 +2,22 @@
 //!
 //! Protocol:
 //!   client -> server (JSON): {type:"hello"|"move"|"move_abs"|"click"|"scroll"|"text"
-//!                                 |"command"|"wake"|"capture"|"ping", ...}
-//!   server -> client (JSON): {type:"devices"|"screen"|"command_result"|"wake_state"|"pong", ...}
+//!                                 |"command"|"wake"|"capture"|"stt_start"|"stt_stop"|"ping", …}
+//!   client -> server (binary): microphone PCM (16-bit LE mono) between stt_start and stt_stop.
+//!                              The mic is on the phone; the model runs here (see stt.rs).
+//!   server -> client (JSON): {type:"devices"|"screen"|"command_result"|"wake_state"
+//!                                 |"stt_partial"|"pong", …}
 //!   server -> client (binary): a PNG crop of the desktop around the cursor, sent while a
 //!                              client has capture on (see capture.rs) — throttled to
 //!                              CAPTURE_INTERVAL and driven off move_abs, so it needs no
 //!                              timer of its own.
+//!
+//! Both directions use binary frames, disambiguated by direction alone: up is audio, down is
+//! a screen crop.
+//!
+//! Dictation is typed by the DAEMON, not the phone: with local STT the transcript lives here,
+//! so the running-transcript diff that used to run in app.js runs in `emit_transcript`. The
+//! `text` message stays for clients without a local model, which still use Web Speech.
 
 mod actions;
 mod capture;
@@ -16,6 +26,7 @@ mod config;
 mod discovery;
 mod input;
 mod screen;
+mod stt;
 mod tls;
 mod voice;
 mod wake;
@@ -48,6 +59,9 @@ struct AppState {
     /// Desktop union + its individual monitors. Capture needs the monitors (a crop must stay
     /// inside one output), so the whole layout is carried, not just the bounds.
     layout: Arc<screen::Layout>,
+    /// Local streaming STT, or None when no model is installed — in which case the client is
+    /// told so and keeps using the browser's Web Speech API.
+    stt: Option<Arc<stt::Stt>>,
     name: String,
 }
 
@@ -77,9 +91,115 @@ async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> impl In
 /// Who am I and how big is my desktop — one frame, sent unprompted on connect so the app
 /// never has to ask before arranging.
 fn screen_frame(st: &AppState) -> String {
+    // `stt` is capability negotiation: with a local model the phone streams raw audio here,
+    // without one it falls back to Web Speech and keeps sending text.
     json!({"type":"screen","name":st.name,"platform":discovery::platform_label(),
-           "w":st.layout.bounds.w,"h":st.layout.bounds.h})
+           "w":st.layout.bounds.w,"h":st.layout.bounds.h,"stt":st.stt.is_some()})
     .to_string()
+}
+
+/// Which push-to-talk button is held: dictation types as you speak, command holds until release.
+#[derive(Clone, Copy, PartialEq)]
+enum SttMode {
+    Type,
+    Command,
+}
+
+/// The write half, shared between the receive loop and detached tasks (capture frames).
+type Sink = Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>;
+
+/// Interleaved 16-bit little-endian PCM -> f32 in [-1, 1). i16 rather than f32 on the wire
+/// halves the uplink for no audible cost at 16 kHz mono, and it is what the AudioWorklet sends.
+/// A trailing odd byte (a split frame) is dropped rather than misread as a sample.
+fn pcm_i16_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect()
+}
+
+/// Turn a new transcript into keystrokes (dictation only) and echo it for the button label.
+///
+/// The diff runs HERE rather than on the phone because the daemon now owns the transcript —
+/// this is the server-side port of `streamText()` in app.js, and the reason the wire protocol
+/// did not have to change for the Web Speech path.
+async fn emit_transcript(
+    st: &AppState,
+    sink: &Sink,
+    u: &mut stt::Utterance,
+    transcript: &str,
+    mode: SttMode,
+) {
+    use futures_util::SinkExt;
+    let text = stt::spoken_to_text(transcript);
+    let edit = u.advance(&text);
+    if mode == SttMode::Type && !edit.is_noop() {
+        // Deletes before the insert, on the one ordered channel — same invariant as the
+        // `text` message from the Web Speech path.
+        for _ in 0..edit.backspaces {
+            let _ = st.tx.send(InputCmd::Key("backspace".into()));
+        }
+        if !edit.append.is_empty() {
+            let _ = st.tx.send(InputCmd::Text(edit.append));
+        }
+    }
+    let _ = sink
+        .lock()
+        .await
+        .send(Message::Text(json!({"type":"stt_partial","text":text}).to_string()))
+        .await;
+}
+
+/// Resolve an utterance through the command table and report one aggregated result. Shared by
+/// the `command` message (Web Speech) and the local-STT path, so both behave identically.
+async fn run_command(st: &AppState, sink: &Sink, t: &str) {
+    use futures_util::SinkExt;
+    let res = commands::route(t);
+
+    // A resolution can expand to many steps (counts, chains). Dispatch them in order on the one
+    // ordered channel, then report ONE aggregated result — the toast is the eyes-off feedback,
+    // so it echoes the canonical intent.
+    let mut inputs = 0usize;
+    let mut launches = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for step in res.steps {
+        match step {
+            Exec::Input(cmd) => {
+                let _ = st.tx.send(cmd);
+                inputs += 1;
+            }
+            Exec::Launch(argv) => match commands::execute_launch(&argv) {
+                Ok(_) => launches += 1,
+                Err(e) => errors.push(e),
+            },
+            Exec::Note(n) => errors.push(n),
+        }
+    }
+    let kind = match (inputs, launches) {
+        (0, 0) => "none",
+        (_, 0) => "input",
+        (0, _) => "launch",
+        _ => "mixed",
+    };
+    let acted = inputs + launches > 0;
+    let ok = res.matched && acted && errors.is_empty();
+    let message = if ok {
+        res.label.clone()
+    } else if !errors.is_empty() {
+        errors.join("; ")
+    } else {
+        res.message.clone().unwrap_or_else(|| "nothing to do".into())
+    };
+    let _ = sink
+        .lock()
+        .await
+        .send(Message::Text(
+            json!({"type":"command_result","ok":ok,"label":res.label,"kind":kind,
+                   "steps":inputs + launches,"message":message})
+                .to_string(),
+        ))
+        .await;
+    eprintln!("[cmd] {t:?} -> {message}");
 }
 
 async fn handle_socket(socket: WebSocket, st: AppState) {
@@ -110,6 +230,9 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
     // Guards against piling up captures if a screenshot takes longer than CAPTURE_INTERVAL —
     // without it, a slow `grim`/`screencapture` would spawn a growing queue of subprocesses.
     let capture_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The in-flight dictation, if this client is holding push-to-talk. `None` between presses.
+    let mut utter: Option<stt::Utterance> = None;
+    let mut utter_mode = SttMode::Type;
 
     loop {
         let msg = match tokio::time::timeout(WAKE_IDLE, stream.next()).await {
@@ -129,6 +252,24 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
+            // Binary from the client is microphone PCM (the phone owns the mic). Decoding is
+            // CPU-bound, so it goes to a blocking thread; the Utterance moves in and comes back
+            // out, which keeps the decoder's state per-connection without a lock.
+            Message::Binary(pcm) => {
+                let (Some(engine), Some(mut u)) = (st.stt.clone(), utter.take()) else { continue };
+                let samples = pcm_i16_to_f32(&pcm);
+                let Ok((mut u, transcript)) = tokio::task::spawn_blocking(move || {
+                    let t = engine.push(&mut u, &samples);
+                    (u, t)
+                })
+                .await
+                else {
+                    continue;
+                };
+                emit_transcript(&st, &sink, &mut u, &transcript, utter_mode).await;
+                utter = Some(u);
+                continue;
+            }
             _ => continue,
         };
         let v: serde_json::Value = match serde_json::from_str(&text) {
@@ -202,53 +343,8 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                 }
             }
             "command" => {
-                let t = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
-                let res = commands::route(t);
-
-                // A resolution can expand to many steps (counts, chains). Dispatch them in
-                // order on the one ordered channel, then report ONE aggregated result — the
-                // toast is the eyes-off feedback, so it echoes the canonical intent.
-                let mut inputs = 0usize;
-                let mut launches = 0usize;
-                let mut errors: Vec<String> = Vec::new();
-                for step in res.steps {
-                    match step {
-                        Exec::Input(cmd) => {
-                            let _ = st.tx.send(cmd);
-                            inputs += 1;
-                        }
-                        Exec::Launch(argv) => match commands::execute_launch(&argv) {
-                            Ok(_) => launches += 1,
-                            Err(e) => errors.push(e),
-                        },
-                        Exec::Note(n) => errors.push(n),
-                    }
-                }
-                let kind = match (inputs, launches) {
-                    (0, 0) => "none",
-                    (_, 0) => "input",
-                    (0, _) => "launch",
-                    _ => "mixed",
-                };
-                let acted = inputs + launches > 0;
-                let ok = res.matched && acted && errors.is_empty();
-                let message = if ok {
-                    res.label.clone()
-                } else if !errors.is_empty() {
-                    errors.join("; ")
-                } else {
-                    res.message.clone().unwrap_or_else(|| "nothing to do".into())
-                };
-                let _ = sink
-                    .lock()
-                    .await
-                    .send(Message::Text(
-                        json!({"type":"command_result","ok":ok,"label":res.label,"kind":kind,
-                               "steps":inputs + launches,"message":message})
-                            .to_string(),
-                    ))
-                    .await;
-                eprintln!("[cmd] {t:?} -> {message}");
+                let t = v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                run_command(&st, &sink, &t).await;
             }
             // Focus-follows-wake-lock: the app sends on:true while it's focused (plus a
             // heartbeat), on:false when hidden. One reference per connection, so a repeated
@@ -278,6 +374,47 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
             "capture" => {
                 capturing = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
             }
+            // Push-to-talk pressed. `rate` is whatever the phone's AudioContext gave us; the
+            // engine resamples. A second start without a stop just replaces the utterance.
+            "stt_start" => {
+                let Some(engine) = st.stt.clone() else { continue };
+                utter_mode = match v.get("mode").and_then(|x| x.as_str()) {
+                    Some("command") => SttMode::Command,
+                    _ => SttMode::Type,
+                };
+                let rate = v.get("rate").and_then(|x| x.as_i64()).unwrap_or(48000) as i32;
+                utter = tokio::task::spawn_blocking(move || engine.start(rate, None)).await.ok();
+            }
+            // Released. Flush the tail, type whatever is left, and for a command hand the final
+            // text to the same router the Web Speech path uses.
+            "stt_stop" => {
+                let (Some(engine), Some(mut u)) = (st.stt.clone(), utter.take()) else { continue };
+                let Ok((mut u, transcript)) =
+                    tokio::task::spawn_blocking(move || {
+                        let t = engine.finish(&mut u);
+                        (u, t)
+                    })
+                    .await
+                else {
+                    continue;
+                };
+                emit_transcript(&st, &sink, &mut u, &transcript, utter_mode).await;
+                let final_text = u.emitted().to_string();
+                match utter_mode {
+                    // Trailing space so the next dictation isn't glued on — matches what the
+                    // Web Speech path does in app.js::finish().
+                    SttMode::Type => {
+                        if !final_text.is_empty() {
+                            let _ = st.tx.send(InputCmd::Text(" ".into()));
+                        }
+                    }
+                    SttMode::Command => {
+                        if !final_text.trim().is_empty() {
+                            run_command(&st, &sink, &final_text).await;
+                        }
+                    }
+                }
+            }
             "hello" => {
                 let mut s = sink.lock().await;
                 let _ = s.send(Message::Text(screen_frame(&st))).await;
@@ -306,6 +443,8 @@ enum Mode {
     Check(String),
     /// List the action allowlist (the names a commands.toml rule may reference).
     Actions,
+    /// Download the local speech model so dictation runs offline instead of via Web Speech.
+    FetchModel,
 }
 
 fn parse_args() -> (String, u16, Mode) {
@@ -320,6 +459,7 @@ fn parse_args() -> (String, u16, Mode) {
             "--port" => { if let Some(v) = args.get(i + 1) { port = v.parse().unwrap_or(8443); i += 1; } }
             "--check" => { if let Some(v) = args.get(i + 1) { mode = Mode::Check(v.clone()); i += 1; } }
             "--actions" => mode = Mode::Actions,
+            "--fetch-model" => mode = Mode::FetchModel,
             _ => {}
         }
         i += 1;
@@ -388,6 +528,13 @@ async fn main() {
     match mode {
         Mode::Actions => return print_actions(),
         Mode::Check(p) => return check(&p),
+        Mode::FetchModel => {
+            if let Err(e) = stt::fetch_model() {
+                eprintln!("fetch-model: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Mode::Serve => {}
     }
     let ip = tls::lan_ip();
@@ -395,6 +542,9 @@ async fn main() {
 
     let layout = Arc::new(screen::detect());
     let tx = input::spawn_worker(layout.bounds);
+    // Leave a core for the rest of the daemon; decoding must not starve input injection.
+    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) as i32 - 1).max(1);
+    let stt = stt::Stt::load(threads.min(4)).map(Arc::new);
     let disc = Discovery::start(name.clone(), ip.clone(), port);
     let (cert_pem, key_pem) = tls::ensure_cert();
     let wake = Arc::new(WakeLock::detect());
@@ -405,7 +555,7 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/", get(index))
         .fallback_service(ServeDir::new(web_dir()))
-        .with_state(AppState { tx, disc, wake, layout, name: name.clone() });
+        .with_state(AppState { tx, disc, wake, layout, stt, name: name.clone() });
 
     let config = RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
         .await
@@ -420,4 +570,29 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .expect("server");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pcm_decodes_little_endian_and_normalizes() {
+        // 0, +1, -1, full-scale negative.
+        let bytes = [0x00, 0x00, 0x01, 0x00, 0xff, 0xff, 0x00, 0x80];
+        let s = pcm_i16_to_f32(&bytes);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0], 0.0);
+        assert!((s[1] - 1.0 / 32768.0).abs() < 1e-9);
+        assert!((s[2] + 1.0 / 32768.0).abs() < 1e-9);
+        assert_eq!(s[3], -1.0);
+        assert!(s.iter().all(|v| (-1.0..1.0).contains(v)));
+    }
+
+    #[test]
+    fn a_split_sample_is_dropped_not_misread() {
+        // WS frames can land mid-sample; a stray byte must not shift every later sample.
+        assert_eq!(pcm_i16_to_f32(&[0x00, 0x80, 0x11]).len(), 1);
+        assert!(pcm_i16_to_f32(&[0x42]).is_empty());
+    }
 }

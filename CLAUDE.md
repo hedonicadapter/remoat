@@ -142,6 +142,48 @@ real cursor. Two different bugs:
 - **No auth gate on this** (see "Open threads" — it was already the top-priority gap for input;
   this adds live screen contents to what an unauthenticated LAN client can pull).
 
+**Local streaming speech-to-text BUILT** (`src/stt.rs`, `web/pcm-worklet.js`) — and unlike the
+capture feature, this one is **verified end-to-end on real audio through a real browser**.
+- **Why a streaming transducer and not Whisper.** Live typing while you speak is a hard
+  requirement. Whisper is batch and pads every inference to 30s, so faking partials means
+  re-transcribing a growing buffer — slow and O(n²). A zipformer **transducer** (sherpa-onnx
+  `OnlineRecognizer`) decodes frame-synchronously with cached state, so partials are free.
+  Measured bonus: it is **append-only** — 0 backspaces across 104 typed chars — so dictation
+  rarely retracts characters from your document. Whisper-based options (`whisper-rs`,
+  `transcribe-rs`, Handy's stack) were rejected for exactly this; `vosk` and
+  `sherpa-transducers` for being stale (Oct 2024 / Apr 2025) and, for vosk, absent from nixpkgs.
+- **The mic is on the phone, the model runs on the desktop.** So `cpal` is irrelevant here.
+  `web/pcm-worklet.js` captures via AudioWorklet (NOT MediaRecorder — iOS emits mp4/AAC, which
+  would need a decoder on the daemon), converts to Int16 in the audio thread, and posts ~100ms
+  batches that go up as WS **binary frames**. Both directions now use binary, disambiguated by
+  direction alone: up is audio, down is a screen crop.
+- **No `rubato`.** sherpa-onnx ships `LinearResampler`; the phone's 48kHz is converted in-engine.
+  One fewer dependency than the plan called for.
+- **The daemon types, not the phone.** With a local model the transcript lives on the daemon, so
+  `streamText()`'s running-transcript diff was ported into `emit_transcript`/`stt::diff`. The
+  diff is **char-wise, not byte-wise** — it drives real backspaces, and a byte split would both
+  miscount and panic on a multi-byte boundary. The `text` message stays for Web Speech clients.
+- **Graceful degradation is the design, not a fallback bolted on.** No model => `screen` frame
+  reports `stt:false` => the phone keeps using Web Speech. `remoat --fetch-model` installs it
+  (~122MB download, ~42MB int8 weights) into `$XDG_STATE_HOME/remoat/models`, the same
+  state-not-store pattern as the TLS certs. Deliberately an explicit command, not a surprise
+  first-run download.
+- **`PAD_SAMPLES` is load-bearing, not defensive.** The streaming encoder needs warm-up frames:
+  with no lead-in silence the model **drops the opening words outright** (0s and 0.3s both gave
+  "THE YELLOW LAMPS…"; 0.5s gave the correct "AFTER EARLY NIGHTFALL THE YELLOW LAMPS…"). A user
+  presses PTT and talks immediately, so the lead-in a recogniser wants is exactly what live
+  dictation never has. A trailing pad likewise flushes the last token. Don't remove either.
+- Hotwords (biasing decoding toward the command table — the thing that would replace `voice.rs`'s
+  hand-written `FIXUPS`) are plumbed through `start()` but **currently inert**: sherpa only
+  applies them under `modified_beam_search`, and we decode greedily for latency. See Open threads.
+
+Verified: 64 unit tests including real decodes of the model's bundled reference wavs (WER < 0.15,
+streaming in 100ms chunks, partials confirmed to arrive before 50% of the audio, and the 8kHz wav
+exercising the resampler). Then end-to-end over real WS/TLS: injected fragments reassemble
+*exactly* to the transcript with **zero backspaces**. Then the real PWA in real Chromium with a
+fake audio device feeding a wav into `getUserMedia`: the button subtitle flipped to
+"dictation · on-device" and the label showed a live growing transcript while held.
+
 **Daemon rewritten from Python to Rust** (`src/`). Reason: Python packaging friction
 under Nix (pyautogui pulls Linux-only `scrot`, venv/pyobjc mess). Rust = single binary,
 clean `buildRustPackage`, `nix run` works on darwin + Linux. The PWA (`web/`) and the WS
@@ -199,6 +241,9 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
 - From source: `nix develop --command cargo run` (devShells.default has cargo + cmake).
 - macOS injection needs Accessibility granted to the launching terminal (rotating
   `/nix/store` path makes granting the store binary impractical — grant the terminal).
+- `remoat --fetch-model` once per machine for offline on-device dictation. Without it the
+  daemon still runs and the phone falls back to the browser's Web Speech API (which sends your
+  audio to Apple/Google — the reason local STT exists).
 
 ## Open threads / next steps
 
@@ -208,7 +253,19 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
 - Wire the LLM/MCP command fallback (`src/commands.rs:llm_fallback`). The tool schema's
   action parameter should be `enum: actions::NAMES` + an integer count, so the model can
   emit nothing the deterministic tier couldn't.
-- Move STT onto the daemon (whisper.cpp) — drop an audio→text step before the WS handler.
+- ~~Move STT onto the daemon~~ — DONE, see "Local streaming speech-to-text" above (streaming
+  zipformer transducer, not whisper.cpp; the reasoning is worth reading before revisiting).
+- **Wire up hotwords** so decoding is biased toward the command table — this is what would let
+  `voice.rs`'s hand-maintained `FIXUPS` mishearing list shrink, and it would update itself when
+  the user edits `commands.toml`. Blocked on sherpa only honouring hotwords under
+  `modified_beam_search`: the command path would need its own recognizer instance (~40MB more
+  resident) so dictation can keep decoding greedily for latency. `Stt::start()` already takes
+  the argument.
+- **`nix build` is UNVERIFIED for the STT change** — no nix in the cloud container. The
+  mechanism it depends on *was* verified directly: with `SHERPA_ONNX_LIB_DIR` set and the
+  download cache deleted, `sherpa-onnx-sys` recompiled and linked the system library with no
+  network fetch. Confirm on a real machine, and note nixpkgs has sherpa-onnx 1.13.3 vs the
+  crate's 1.13.4 — close, but a future bump could desync.
 - Confirm the Linux/Hyprland Rust build on the nixos box (unbuilt on the dev Mac). Same
   trip: exercise the linux chords in `actions.rs` — `delete_line` (shift+home, backspace),
   `line_start`/`line_end` (home/end), `doc_start`/`doc_end` (ctrl+home/end). Keycodes are
@@ -324,6 +381,15 @@ Where the implementation deviates from the original design note:
   sent capture crops into uncovered space. Divide by `scale`, and prefer a compositor that hands
   you the logical rect outright (`niri msg --json outputs` → `logical`). Also: don't assume the
   layout origin is 0,0, and don't assume the union is fully covered by outputs.
+- **`sherpa-onnx-sys` DOWNLOADS a prebuilt archive from GitHub in its build script** unless
+  `SHERPA_ONNX_LIB_DIR` (or `SHERPA_ONNX_ARCHIVE_DIR`) is set — a sandboxed nix build cannot do
+  that, so the flake sets it and so does the devShell. It also uses `ureq` with bundled roots,
+  so it ignores a proxy CA: behind one, pre-download the archive and point
+  `SHERPA_ONNX_ARCHIVE_DIR` at the directory holding it.
+- **`cargo run`/`cargo test` find `libsherpa-onnx-c-api.so`, a direct `./target/debug/remoat`
+  does not.** Cargo adds native link-search paths to the loader path; running the binary
+  yourself needs `LD_LIBRARY_PATH`. Under nix this is a non-issue (rpath is set from the store
+  path), but it will look like a broken build in a dev checkout.
 - **A tool referenced in code is not a tool on PATH.** `wlr-randr` was in `screen.rs`'s fallback
   chain but never in the flake's `runtimeTools`, so on niri the whole chain missed and the
   1920x1080 default took over — with no error, because every probe "just" returned None. When
