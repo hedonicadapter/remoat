@@ -179,8 +179,11 @@ capture feature, this one is **verified end-to-end on real audio through a real 
   2023-06-26      fp32 beam    0.0%      0.137
   ```
   Worth keeping: **int8 costs no accuracy here and is 45% faster than fp32** — don't "upgrade"
-  to fp32. **Beam search only helped the small model**, but stays because it is the only mode
-  sherpa applies hotwords in, and RTF ~0.1 leaves a 10x realtime margin either way.
+  to fp32. **Beam search only helped the small model** (7.7%→6.3%) and bought nothing on this one
+  (0.0% either way) while costing ~20% more decode time and re-ranking partials more — which is
+  visible churn when the output is live keystrokes. It was briefly the default only because
+  hotwords require it; since hotwords are still inert that was a cost with no benefit, and the
+  default is back to `greedy_search`.
   Model files are located by PREFIX (`encoder*`/`decoder*`/`joiner*`) since names differ across
   the zoo, so `REMOAT_STT_MODEL` can point at any streaming transducer, by name or absolute
   path; `REMOAT_STT_PRECISION=fp32` and `REMOAT_STT_DECODING=greedy_search` are the other knobs.
@@ -394,6 +397,31 @@ utterance → static table → DYNAMIC TIER → llm_fallback
   `run niri msg action focus-window --id 7` without doing it. New `Exec::Run` waits for exit
   status (unlike `Exec::Launch`, which spawns and forgets) because for WM IPC whether it
   *worked* is the whole point of the toast.
+
+First real-hardware feedback (both machines) found four separate bugs, all fixed — the failure
+modes are worth knowing because each is a different kind of mistake:
+- **"focus zen" did nothing while "focus spotify" worked.** Two Zen windows both scored 1.0, and
+  the tie-refusal killed it. Refusing a near-tie is right ACROSS apps and wrong WITHIN one: three
+  windows of one browser means "go to the browser", not "ambiguous". `best_of` now takes a
+  grouping function and only refuses when the tied candidates belong to different apps.
+- **"focus browser" could never have worked.** Nothing on the machine is called "browser" — it's
+  a synonym problem, and no amount of fuzzy string matching bridges it. `ALIASES` maps generic
+  nouns (browser/terminal/editor/music/files/chat/mail) to the identities that satisfy them, and
+  an alias group is a disjunction: any member matching is a hit.
+- **"switch workspace 3" fell through** because the prefix list had `"switch to "` but not
+  `"switch workspace"`. Phrase coverage was too rigid; `workspace_number` now strips a verb list
+  (go to / switch / switch to / change / jump to / show) independently of the noun.
+- **"move window left" wasn't implemented at all.** The trait gained directional move/focus,
+  relative workspace, close, fullscreen, float and move-to-workspace. All return `Option` so a
+  backend can DECLINE — omniwm's CLI docs don't cover close/fullscreen/next-workspace, so it
+  reports "omniwm can't close window" rather than us guessing a subcommand name.
+- Bonus conflict found the same way: the builtin table claimed `"close window"` for `close_tab`,
+  and since the static table matches first, "close window" was closing a TAB. Each phrase now has
+  exactly one owner.
+
+**niri's scrolling layout needs care**: horizontal motion moves the whole COLUMN
+(`move-column-left`), vertical motion moves the window inside it (`move-window-down`). Asking
+for `move-window-left` is silently a no-op.
 
 Verified with stand-in `niri`/`omniwmctl` binaries and a fixture desktop-entry dir: both
 backends resolve focus/workspace correctly, IPC-disabled and no-WM-at-all both degrade with the

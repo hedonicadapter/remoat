@@ -27,7 +27,8 @@ use sherpa_onnx::{
 /// bundled reference wavs, RTF = decode time / audio duration on 3 threads):
 ///   20M-2023-02-17  int8 greedy  7.7% WER  0.051 RTF
 ///   20M-2023-02-17  int8 beam    6.3%      0.060
-///   2023-06-26      int8 beam    0.0%      0.095   <- this one
+///   2023-06-26      int8 greedy  0.0%      0.079   <- this one
+///   2023-06-26      int8 beam    0.0%      0.095
 ///   2023-06-26      fp32 beam    0.0%      0.137
 /// The first cut shipped the 20M model to keep the download small; it was audibly worse in
 /// real use. This one is ~71 MB of int8 weights (296 MB tarball) and still decodes ~10x faster
@@ -150,11 +151,12 @@ impl Stt {
         }
         let f = find_model(&dir, prefer_int8())?;
         let s = |p: &Path| Some(p.to_string_lossy().into_owned());
-        // modified_beam_search is measurably more accurate than greedy and, on a streaming
-        // transducer, cheap enough to stay realtime — the earlier greedy default was chosen for
-        // latency before that was measured. It is also the only mode sherpa applies hotwords in.
-        let method = std::env::var("REMOAT_STT_DECODING")
-            .unwrap_or_else(|_| "modified_beam_search".into());
+        // greedy_search, on the measurements: beam search improved the SMALL model (7.7% ->
+        // 6.3% WER) but bought exactly nothing on this one (0.0% either way) while costing ~20%
+        // more decode time and re-ranking partials more, which shows up as churn when the
+        // output is live keystrokes. It was briefly the default only because hotwords need it,
+        // and hotwords are still inert — a cost with no benefit attached.
+        let method = std::env::var("REMOAT_STT_DECODING").unwrap_or_else(|_| "greedy_search".into());
         let mut config = OnlineRecognizerConfig {
             model_config: OnlineModelConfig {
                 transducer: OnlineTransducerModelConfig {

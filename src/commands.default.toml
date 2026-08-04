@@ -158,7 +158,10 @@ phrases = ["new tab", "open a new tab"]
 action = "new_tab"
 
 [[rules]]
-phrases = ["close tab", "close window", "close this"]
+# "close window" deliberately NOT here: with a window manager available it must close the
+# WINDOW (see dynamic.rs WINDOW_ACTIONS), and the static table matches first, so claiming the
+# phrase here silently turned "close window" into a tab close.
+phrases = ["close tab", "close this"]
 action = "close_tab"
 
 [[rules]]

@@ -32,6 +32,37 @@ pub struct Window {
     pub app: String,
 }
 
+/// A direction, for moving or focusing relative to the current window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Dir {
+    pub fn parse(s: &str) -> Option<Dir> {
+        Some(match s {
+            "left" => Dir::Left,
+            "right" => Dir::Right,
+            "up" | "above" => Dir::Up,
+            "down" | "below" => Dir::Down,
+            _ => return None,
+        })
+    }
+    pub fn word(&self) -> &'static str {
+        match self {
+            Dir::Left => "left",
+            Dir::Right => "right",
+            Dir::Up => "up",
+            Dir::Down => "down",
+        }
+    }
+}
+
+/// Everything past `windows`/`focus` returns Option so a backend can decline a capability it
+/// genuinely lacks, rather than us guessing a subcommand name and emitting an error toast.
 pub trait Wm: Send + Sync {
     fn name(&self) -> &'static str;
     fn windows(&self) -> Result<Vec<Window>, String>;
@@ -39,6 +70,33 @@ pub trait Wm: Send + Sync {
     fn focus_argv(&self, id: &str) -> Vec<String>;
     /// Switch to a workspace by 1-based index.
     fn workspace_argv(&self, n: i32) -> Vec<String>;
+    /// Move the focused window in a direction.
+    fn move_argv(&self, dir: Dir) -> Option<Vec<String>>;
+    /// Move focus in a direction, without naming a window.
+    fn focus_dir_argv(&self, dir: Dir) -> Option<Vec<String>>;
+    /// Next/previous workspace: +1 / -1.
+    fn workspace_rel_argv(&self, delta: i32) -> Option<Vec<String>>;
+    fn close_argv(&self) -> Option<Vec<String>> {
+        None
+    }
+    fn fullscreen_argv(&self) -> Option<Vec<String>> {
+        None
+    }
+    fn float_argv(&self) -> Option<Vec<String>> {
+        None
+    }
+    /// Send the focused window to a workspace by 1-based index.
+    fn move_to_workspace_argv(&self, _n: i32) -> Option<Vec<String>> {
+        None
+    }
+}
+
+fn niri_action(a: &str) -> Vec<String> {
+    vec!["niri".into(), "msg".into(), "action".into(), a.into()]
+}
+
+fn omni_command(a: &str) -> Vec<String> {
+    vec!["omniwmctl".into(), "command".into(), a.into()]
 }
 
 // ─── niri ──────────────────────────────────────────────────────────────────
@@ -64,7 +122,46 @@ impl Wm for Niri {
         vec!["niri".into(), "msg".into(), "action".into(), "focus-window".into(), "--id".into(), id.into()]
     }
     fn workspace_argv(&self, n: i32) -> Vec<String> {
-        vec!["niri".into(), "msg".into(), "action".into(), "focus-workspace".into(), n.to_string()]
+        let mut v = niri_action("focus-workspace");
+        v.push(n.to_string());
+        v
+    }
+    /// niri's scrolling layout distinguishes columns from windows-within-a-column: horizontal
+    /// motion moves the whole COLUMN, vertical motion moves the window inside it. Using
+    /// `move-window-left` here would silently do nothing.
+    fn move_argv(&self, dir: Dir) -> Option<Vec<String>> {
+        Some(niri_action(match dir {
+            Dir::Left => "move-column-left",
+            Dir::Right => "move-column-right",
+            Dir::Up => "move-window-up",
+            Dir::Down => "move-window-down",
+        }))
+    }
+    fn focus_dir_argv(&self, dir: Dir) -> Option<Vec<String>> {
+        Some(niri_action(match dir {
+            Dir::Left => "focus-column-left",
+            Dir::Right => "focus-column-right",
+            Dir::Up => "focus-window-up",
+            Dir::Down => "focus-window-down",
+        }))
+    }
+    fn workspace_rel_argv(&self, delta: i32) -> Option<Vec<String>> {
+        // Workspaces are a vertical stack on niri, so "next" is down.
+        Some(niri_action(if delta >= 0 { "focus-workspace-down" } else { "focus-workspace-up" }))
+    }
+    fn close_argv(&self) -> Option<Vec<String>> {
+        Some(niri_action("close-window"))
+    }
+    fn fullscreen_argv(&self) -> Option<Vec<String>> {
+        Some(niri_action("fullscreen-window"))
+    }
+    fn float_argv(&self) -> Option<Vec<String>> {
+        Some(niri_action("toggle-window-floating"))
+    }
+    fn move_to_workspace_argv(&self, n: i32) -> Option<Vec<String>> {
+        let mut v = niri_action("move-window-to-workspace");
+        v.push(n.to_string());
+        Some(v)
     }
 }
 
@@ -105,8 +202,29 @@ impl Wm for Omni {
         vec!["omniwmctl".into(), "window".into(), "navigate".into(), id.into()]
     }
     fn workspace_argv(&self, n: i32) -> Vec<String> {
-        vec!["omniwmctl".into(), "command".into(), "switch-workspace".into(), n.to_string()]
+        let mut v = omni_command("switch-workspace");
+        v.push(n.to_string());
+        v
     }
+    fn move_argv(&self, dir: Dir) -> Option<Vec<String>> {
+        let mut v = omni_command("move");
+        v.push(dir.word().into());
+        Some(v)
+    }
+    fn focus_dir_argv(&self, dir: Dir) -> Option<Vec<String>> {
+        let mut v = omni_command("focus");
+        v.push(dir.word().into());
+        Some(v)
+    }
+    fn workspace_rel_argv(&self, _delta: i32) -> Option<Vec<String>> {
+        // Not in the published CLI reference. Guessing a subcommand would turn "next workspace"
+        // into an error toast, so decline and let the phrase go unmatched instead.
+        None
+    }
+    fn float_argv(&self) -> Option<Vec<String>> {
+        Some(omni_command("toggle-focused-window-floating"))
+    }
+    // close/fullscreen/move-to-workspace: likewise undocumented, so deliberately not guessed.
 }
 
 /// omniwm speaks newline-delimited JSON, but tolerate a plain array too — the docs describe
