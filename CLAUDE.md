@@ -357,13 +357,24 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   `ignore_dbus_inhibit=false` (its default). `wlinhibit` is the no-logind fallback and is the
   one path with no pid leash, so it leans on the SIGTERM handler alone.
 - **Touchpad capture (`src/capture.rs`) is entirely unverified on real hardware** — built and
-  argv-checked from a cloud session with no display. On macOS, `screencapture` needs Screen
-  Recording permission granted to the launching terminal (separate from the Accessibility grant
-  input already needs) — untested whether it fails loud or silently without it. On Linux,
-  confirm `grim` actually captures under Hyprland from this daemon (not just from a terminal)
-  and that `-g` geometry syntax is still correct for the installed grim version. Also unverified:
-  whether 8fps/480×300 is remotely the right tradeoff for real Wi-Fi + a real screenshot's
-  actual latency — CAPTURE_INTERVAL and the crop size are guesses, not measurements.
+  argv-checked from a cloud session with no display. On Linux, confirm `grim` actually captures
+  under Hyprland from this daemon (not just from a terminal) and that `-g` geometry syntax is
+  still correct for the installed grim version. Also unverified: whether 8fps/480×300 is
+  remotely the right tradeoff for real Wi-Fi + a real screenshot's actual latency —
+  CAPTURE_INTERVAL and the crop size are guesses, not measurements.
+- **macOS permissions: CONFIRMED to fail LOUD, not silently — and the real gotcha is WHICH
+  process needs the grant.** `screencapture` without Screen Recording permission prints its own
+  error (`cannot create image…`) to stderr; without the fix below in `capture.rs` this was
+  spamming that line on every `move_abs` while dragging (~8/sec) instead of explaining anything
+  once. macOS attributes both this and the Accessibility prompt enigo needs to the *responsible
+  process*, not the leaf binary — launched from Terminal.app, Terminal is responsible; **launched
+  over `ssh`, `sshd` is responsible**, a completely different identity than whatever was granted
+  before. A user hit exactly this: "already granted permission" but the prompt (for `sshd`) kept
+  reappearing, because the earlier grant was to Terminal or to a since-rebuilt nix store path,
+  neither of which apply when the daemon is launched via ssh. Fix is to grant BOTH Accessibility
+  and Screen Recording to `/usr/sbin/sshd` specifically when running this way — and since that's
+  a fixed system path, it's actually a MORE durable grant than "the terminal" for exactly the
+  reason `nix run`'s rotating store path already made unreliable.
 - Screen capture currently ships with **no auth**, same LAN-exposure gap as input (see the
   security item above) — now covering live screen contents too, not just injection.
 

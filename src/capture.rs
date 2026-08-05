@@ -2,9 +2,10 @@
 //! dragging so the touchpad background shows what's actually there instead of a placeholder.
 //!
 //! Same pattern as `input.rs`: shell out to a platform tool rather than link a capture library.
-//!   macOS         -> `screencapture` (built in; needs Screen Recording permission granted to
-//!                     the launching terminal on Catalina+, same story as Accessibility for
-//!                     enigo — see CLAUDE.md gotchas).
+//!   macOS         -> `screencapture` (built in; needs Screen Recording permission — CONFIRMED
+//!                     to fail loud, not silently, and granted to the *responsible process*,
+//!                     which over ssh is sshd rather than Terminal — same story as Accessibility
+//!                     for enigo. See CLAUDE.md gotchas).
 //!   Linux/Wayland -> `grim` (wlr-screencopy; works on niri, Hyprland and other wlroots-style
 //!                     compositors, NOT a portal flow, so no permission dialog per frame).
 //!
@@ -79,13 +80,34 @@ fn platform_capture(r: Rect, dryrun: bool) -> Option<Vec<u8>> {
         println!("[dryrun] screencapture -x -C -t png -R{region} {}", path.display());
         return None;
     }
-    let ok = Command::new("screencapture")
+    let out = Command::new("screencapture")
         .args(["-x", "-C", "-t", "png", &format!("-R{region}")])
         .arg(&path)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .output();
+    let ok = match &out {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    };
     if !ok {
+        // screencapture writes its own error to stderr on every single failed attempt — at
+        // one call per move_abs (throttled to CAPTURE_INTERVAL, ~8/sec while dragging) that
+        // floods the terminal instead of explaining anything. Say it once, clearly, and go
+        // quiet: this is almost always Screen Recording permission not granted to whatever
+        // process actually launched the daemon (Terminal, or — over ssh — sshd itself; see
+        // CLAUDE.md gotchas).
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            let detail = out
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                .filter(|s| !s.is_empty());
+            eprintln!(
+                "[capture] screencapture failed{} — grant Screen Recording (System Settings > \
+                 Privacy & Security) to whatever process launched this daemon; over ssh that's \
+                 sshd, not Terminal. Not repeating this per frame.",
+                detail.map(|d| format!(": {d}")).unwrap_or_default()
+            );
+        });
         return None;
     }
     let bytes = std::fs::read(&path).ok();
