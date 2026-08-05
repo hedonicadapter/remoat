@@ -87,8 +87,45 @@ fn auto_backend(_dryrun: bool, _bounds: Bounds) -> Box<dyn Backend> {
     Box::new(NullBackend::new("unsupported platform".into()))
 }
 
+/// Query (and optionally force-prompt for) Accessibility trust directly, bypassing enigo.
+///
+/// This exists because `CGEventPost` — what every enigo call on macOS bottoms out at — is a
+/// `void` C function with no error return. If the process isn't trusted, macOS just drops the
+/// event; enigo's `move_mouse`/`key`/etc. all still return `Ok(())` regardless. So there is no
+/// way to detect a permissions failure from enigo's return values, ever — a symptom that looks
+/// identical to "everything is fine" and to "silently blocked" from inside the daemon. This
+/// calls the real trust API ourselves so startup says which one it actually is.
+#[cfg(target_os = "macos")]
+fn check_accessibility_trust(prompt: bool) -> bool {
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+    }
+
+    let key = CFString::new("AXTrustedCheckOptionPrompt");
+    let value = if prompt { CFBoolean::true_value() } else { CFBoolean::false_value() };
+    let dict = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
+    unsafe { AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef()) }
+}
+
 #[cfg(target_os = "macos")]
 fn make_enigo() -> Box<dyn Backend> {
+    if check_accessibility_trust(false) {
+        eprintln!("[input] macOS Accessibility: trusted");
+    } else {
+        eprintln!(
+            "[input] macOS Accessibility: NOT TRUSTED. Mouse/keyboard events will be silently \
+             dropped by the OS — enigo cannot detect or report this, so nothing else in this \
+             log will ever show it. Forcing the real permission prompt now; grant it to \
+             whatever it names, then fully quit and relaunch this daemon."
+        );
+        check_accessibility_trust(true); // pops the real, correctly-attributed system dialog
+    }
     match Enigo::new(&Settings::default()) {
         Ok(enigo) => Box::new(EnigoBackend { enigo }),
         Err(e) => Box::new(NullBackend::new(format!("enigo: {e}"))),

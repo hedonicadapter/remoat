@@ -25,8 +25,11 @@ sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"
 
 # enigo (Quartz) only on macOS. Linux uses ydotool (uinput — works on X11 and Wayland),
 # so we avoid enigo's X11/Wayland system-lib build deps on Linux entirely.
+# core-foundation: for calling AXIsProcessTrustedWithOptions directly (see input.rs) — enigo
+# has no way to surface a permissions failure, since CGEventPost returns nothing to check.
 [target.'cfg(target_os = "macos")'.dependencies]
 enigo = "0.2"
+core-foundation = "0.9"
 
 [profile.release]
 opt-level = 2

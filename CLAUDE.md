@@ -362,19 +362,39 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   still correct for the installed grim version. Also unverified: whether 8fps/480×300 is
   remotely the right tradeoff for real Wi-Fi + a real screenshot's actual latency —
   CAPTURE_INTERVAL and the crop size are guesses, not measurements.
-- **macOS permissions: CONFIRMED to fail LOUD, not silently — and the real gotcha is WHICH
-  process needs the grant.** `screencapture` without Screen Recording permission prints its own
-  error (`cannot create image…`) to stderr; without the fix below in `capture.rs` this was
-  spamming that line on every `move_abs` while dragging (~8/sec) instead of explaining anything
-  once. macOS attributes both this and the Accessibility prompt enigo needs to the *responsible
-  process*, not the leaf binary — launched from Terminal.app, Terminal is responsible; **launched
-  over `ssh`, `sshd` is responsible**, a completely different identity than whatever was granted
-  before. A user hit exactly this: "already granted permission" but the prompt (for `sshd`) kept
-  reappearing, because the earlier grant was to Terminal or to a since-rebuilt nix store path,
-  neither of which apply when the daemon is launched via ssh. Fix is to grant BOTH Accessibility
-  and Screen Recording to `/usr/sbin/sshd` specifically when running this way — and since that's
-  a fixed system path, it's actually a MORE durable grant than "the terminal" for exactly the
-  reason `nix run`'s rotating store path already made unreliable.
+- **macOS permissions: Screen Recording CONFIRMED to fail LOUD; Accessibility fails in
+  ABSOLUTE SILENCE, and that silence is structural, not a logging gap.** `screencapture` without
+  Screen Recording permission prints its own error (`cannot create image…`) to stderr; without
+  the fix in `capture.rs` this was spamming that line on every `move_abs` while dragging
+  (~8/sec) instead of explaining anything once.
+  Accessibility is the opposite problem, and it took a real debugging session (reproduced below
+  because the dead ends are as instructive as the answer) to find why: `CGEventPost` — what
+  every enigo mouse/keyboard call bottoms out at — is a `void` C function with **no error
+  return**. If the process isn't trusted, macOS silently drops the event; enigo's `move_mouse`
+  still returns `Ok(())`. There is no return value, no error, and — unlike ScreenCapture's
+  request/response flow — no `log stream --predicate 'subsystem == "com.apple.TCC"'` entry
+  either, because a raw `CGEventPost` doesn't go through the request-arbitration path that
+  generates that log at all. **A blocked cursor and a working one look byte-for-byte identical
+  from inside the daemon.** Fixed in `input.rs::check_accessibility_trust`: call
+  `AXIsProcessTrustedWithOptions` directly via `core-foundation`, log the real answer at
+  startup, and if untrusted, pass the prompt option so macOS raises the correctly-attributed
+  system dialog itself instead of us inferring identity from context.
+  Dead ends worth knowing so they aren't retried: (1) macOS attributes TCC checks to the
+  *responsible process*, not the leaf binary, which sent early debugging toward "grant `sshd`"
+  since the user described launching over ssh — wrong in this case, since `ps aux | grep sshd`
+  showed no such process running at all. (2) `log stream` itself has three unrelated shell
+  landmines that ate several rounds before any real log was seen: smart-quote corruption of the
+  `--predicate` string from copy/paste ("too many arguments"), a shell builtin literally named
+  `log` in zsh (leftover from the `WATCH`/login-monitoring feature) shadowing `/usr/bin/log`
+  (fix: `command log …`), and needing `sudo` for TCC's own log lines specifically. (3) The
+  actual live popup during debugging named `skhd` (a hotkey daemon), an apparently unrelated
+  process — plausible now given point (1): TCC's responsible-process resolution can name a
+  different identity than the terminal you're staring at, and there is no shortcut around
+  reading real evidence (`log stream`, then eventually the direct API call) to find out which
+  one actually matters for a given code path. (4) The eventual real answer, from the log, was
+  that the daemon runs from **Kitty** (`net.kovidgoyal.kitty`, itself a nix store path — same
+  rotation problem as remoat's own binary), confirmed for Screen Recording; Accessibility could
+  never be confirmed via log at all, which is the whole point above.
 - Screen capture currently ships with **no auth**, same LAN-exposure gap as input (see the
   security item above) — now covering live screen contents too, not just injection.
 
@@ -502,6 +522,12 @@ Where the implementation deviates from the original design note:
 - **Nothing can pin both pointer axes without visiting a corner**, so relative backends home by
   slamming into one — never the top-left (niri's default hot corner, GNOME's Activities).
   `home_corner()` picks the nearest of the other three; a test asserts it never returns 0,0.
+- **`CGEventPost` (macOS input injection) cannot report failure — full stop.** It's a `void` C
+  function; without Accessibility trust it silently drops the event and every enigo call still
+  returns `Ok(())`. Don't add error handling here expecting it to ever fire — it structurally
+  can't. The only way to know trust state is to ask `AXIsProcessTrustedWithOptions` directly
+  (`input.rs::check_accessibility_trust`), which is also the only way to raise the *correctly
+  attributed* system prompt instead of guessing which process macOS means.
 - **A dry-run argv check is not hardware verification.** Both ydotool bugs so far (the `-w`
   wheel flags, then this) passed dry-run and failed on the real box.
 - **Screen geometry: everything outside a monitor's own mode is LOGICAL (post-scale).** Pointer

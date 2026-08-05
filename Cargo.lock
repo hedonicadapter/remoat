@@ -1176,6 +1176,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
+ "core-foundation",
  "enigo",
  "futures-util",
  "gethostname",
