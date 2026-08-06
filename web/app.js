@@ -177,7 +177,8 @@ import {
     // Capture follows it too — a crossing mid-drag must keep streaming from the new device.
     if (capturing) {
       if (prev) sendTo(prev, { type: "capture", on: false });
-      sendTo(id, { type: "capture", on: true, zoom });
+      // cursorXY() reads `activeId`, which is already `id` by this point (set above).
+      sendTo(id, { type: "capture", on: true, zoom, ...(cursorXY() || {}) });
     }
     padcap.classList.remove("show");   // last frame belonged to the device we just left
     const d = devices.get(id);
@@ -347,6 +348,19 @@ import {
   let capturing = false;   // requesting live capture frames from the active device while dragging
   let pinchStartDist = 0, pinchStartZoom = 1, zoomDirty = false;   // two-finger pinch-to-zoom
 
+  /// Where the daemon should center a capture: the shared cursor position, converted to the
+  /// active device's local coords the same way move_abs's target is (`placeCursor`). Included
+  /// on every capture/capture_zoom message so a pinch or a zoom-button tap works even before
+  /// any move_abs has happened this connection (e.g. starting a pinch right at touchdown).
+  function cursorXY() {
+    if (!cursor || cursor.id !== activeId) return null;
+    return localOf(rects(), activeId, cursor.gx, cursor.gy);
+  }
+
+  function sendCaptureZoom() {
+    sendActive({ type: "capture_zoom", zoom, ...(cursorXY() || {}) });
+  }
+
   function flush() {
     rafPending = false;
     if (pendDx || pendDy) {
@@ -359,7 +373,7 @@ import {
     }
     if (zoomDirty) {
       zoomDirty = false;
-      sendActive({ type: "capture_zoom", zoom });
+      sendCaptureZoom();
     }
   }
   function schedule() { if (!rafPending) { rafPending = true; requestAnimationFrame(flush); } }
@@ -400,7 +414,7 @@ import {
     maxTouches = e.touches.length;
     capturing = true;
     pinchStartDist = 0;
-    sendActive({ type: "capture", on: true, zoom });
+    sendActive({ type: "capture", on: true, zoom, ...(cursorXY() || {}) });
   }, { passive: false });
 
   function pinchDist(touches) {
@@ -445,6 +459,18 @@ import {
     capturing = false;
     sendActive({ type: "capture", on: false });
   }, { passive: false });
+
+  // ---- zoom buttons: same effect as a pinch, for anyone whose pinch gesture the browser eats ----
+  const ZOOM_STEP = 1.3;
+  function bumpZoom(mult) {
+    const z = clampZoom(zoom * mult);
+    if (z === zoom) return;
+    zoom = z;
+    saveZoom();
+    sendCaptureZoom();
+  }
+  $("zoomin").addEventListener("click", () => bumpZoom(1 / ZOOM_STEP));
+  $("zoomout").addEventListener("click", () => bumpZoom(ZOOM_STEP));
 
   // ---- scroll bars (right = vertical, bottom = horizontal) ----
   // Drag toward the bottom/right scrolls the target down/right (scrollbar-style).

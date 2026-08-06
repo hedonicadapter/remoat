@@ -158,6 +158,28 @@ changes as a separate `{type:"capture_zoom",zoom}` throttled through the existin
 current zoom to the new device the same way it already carries `capturing`. 101 unit tests
 (3 new, for zoom clamping/scaling), 20 JS tests.
 
+First real-hardware feedback: zoom did nothing in either direction. Two stacked bugs, both in
+the daemon, not the gesture:
+- **`capture_around` only ever ran from inside the `move_abs` handler.** A pinch deliberately
+  suppresses the single-finger path that sends `move_abs` (so a 2-finger touch isn't also read
+  as a drag), so pinching updated the server's `capture_zoom` state but never asked for a new
+  screenshot — the crop was frozen until the user went back to one-finger dragging, at which
+  point it silently picked up the new size. Fixed by factoring the spawn-capture-and-push logic
+  into `spawn_capture()` so `capture_zoom` can also trigger an immediate capture, gated by the
+  same `CAPTURE_INTERVAL`/`capture_busy` as `move_abs` already used.
+- **Even then, zooming right at touchdown (2 fingers down before any single-finger drag this
+  connection) still had nowhere to center the capture** — the position to re-capture at
+  (`last_xy`) was only ever learned from a `move_abs`. Fixed by having the client send its own
+  `x`/`y` (converted via the same `localOf` used for `move_abs`, from the cursor position it
+  already tracks) on `capture`/`capture_zoom` too, so the daemon never depends on a drag step
+  having happened first.
+- **Added dedicated +/- zoom buttons** (`#zoomctl`) as a reliable non-gesture fallback, since a
+  pinch is easy for the browser or OS to eat and hard to debug blind. Deliberately a DOM
+  *sibling* of `#pad`, not a child — sharing its grid cell (`grid-column/row: 1`, anchored
+  bottom-right) so they visually overlay its corner without ever entering `#pad`'s touch
+  handlers; no `stopPropagation` needed because hit-testing routes the tap to whichever element
+  is actually on top, and the buttons aren't in `#pad`'s subtree at all.
+
 **Local streaming speech-to-text BUILT** (`src/stt.rs`, `web/pcm-worklet.js`) — and unlike the
 capture feature, this one is **verified end-to-end on real audio through a real browser**.
 - **Why a streaming transducer and not Whisper.** Live typing while you speak is a hard

@@ -410,15 +410,39 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                 if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
                     capture_zoom = capture::clamp_zoom(z as f32);
                 }
+                // The client also knows where the cursor already is (it tracks the shared
+                // position independent of move_abs), so a pinch or a zoom button press right
+                // at touchstart — before any drag step has run this connection — still has
+                // somewhere to center the refreshed capture on.
+                if let (Some(x), Some(y)) =
+                    (v.get("x").and_then(|x| x.as_f64()), v.get("y").and_then(|x| x.as_f64()))
+                {
+                    last_xy = Some((x as i32, y as i32));
+                }
+                if capturing {
+                    if let Some((x, y)) = last_xy {
+                        let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
+                        spawn_capture(
+                            x, y, capture_zoom, st.layout.clone(), dryrun, sink.clone(),
+                            &mut last_capture, &capture_busy,
+                        );
+                    }
+                }
             }
-            // Pinch-to-zoom, live, while already dragging. Re-validated here rather than
-            // trusted from the wire — the client decides the number, the daemon decides what a
-            // shell-out is allowed to ask a screenshot tool for.
+            // Pinch-to-zoom (or the +/- buttons), live, possibly while not otherwise dragging.
+            // Re-validated here rather than trusted from the wire — the client decides the
+            // number, the daemon decides what a shell-out is allowed to ask a screenshot tool
+            // for.
             "capture_zoom" => {
+                if let (Some(x), Some(y)) =
+                    (v.get("x").and_then(|x| x.as_f64()), v.get("y").and_then(|x| x.as_f64()))
+                {
+                    last_xy = Some((x as i32, y as i32));
+                }
                 if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
                     capture_zoom = capture::clamp_zoom(z as f32);
-                    // A pinch alone sends no move_abs, so without this the resized crop would
-                    // never actually reach the phone until the next single-finger drag step.
+                    // Neither a pinch nor a button press sends a move_abs, so without this the
+                    // resized crop would never actually reach the phone until the next drag step.
                     if capturing {
                         if let Some((x, y)) = last_xy {
                             let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();

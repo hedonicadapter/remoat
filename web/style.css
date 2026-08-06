@@ -83,6 +83,25 @@ main#pad {
   object-fit: cover; opacity: 0; transition: opacity .15s; pointer-events: none;
 }
 #padcap.show { opacity: 1; }
+
+/* Zoom buttons: a sibling of #pad (not a child), sharing its grid cell so they overlay its
+   corner — kept out of #pad's own DOM subtree so its touchstart/move/end listeners never see
+   taps on them (no stopPropagation gymnastics needed). */
+#zoomctl {
+  grid-column: 1; grid-row: 1;
+  justify-self: end; align-self: end;
+  margin: 10px; z-index: 2;
+  display: flex; flex-direction: column; gap: 8px;
+}
+#zoomctl button {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: color-mix(in srgb, var(--pad) 70%, #000 30%);
+  border: 1px solid var(--line); color: var(--fg);
+  font: 22px/1 -apple-system, system-ui, sans-serif; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+  opacity: .82;
+}
+#zoomctl button:active { transform: scale(.92); border-color: var(--accent); opacity: 1; }
 #vbar { grid-column: 2; grid-row: 1; }
 #hbar { grid-column: 1; grid-row: 2; }
 .scrollbar {
