@@ -2,7 +2,8 @@
 //!
 //! Protocol:
 //!   client -> server (JSON): {type:"hello"|"move"|"move_abs"|"click"|"scroll"|"text"
-//!                                 |"command"|"wake"|"capture"|"stt_start"|"stt_stop"|"ping", …}
+//!                                 |"command"|"wake"|"capture"|"capture_zoom"
+//!                                 |"stt_start"|"stt_stop"|"ping", …}
 //!   client -> server (binary): microphone PCM (16-bit LE mono) between stt_start and stt_stop.
 //!                              The mic is on the phone; the model runs here (see stt.rs).
 //!   server -> client (JSON): {type:"devices"|"screen"|"command_result"|"wake_state"
@@ -233,6 +234,9 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
     let mut holding = false;
     // Capture streaming: on only while this client is actively dragging (see "capture" below).
     let mut capturing = false;
+    // Pinch-to-zoom on the capture region — 1.0 is the base crop size. Persists across a
+    // reconnect only as far as the client re-sends it; the server holds no history of it.
+    let mut capture_zoom: f32 = 1.0;
     let mut last_capture: Option<std::time::Instant> = None;
     // Guards against piling up captures if a screenshot takes longer than CAPTURE_INTERVAL —
     // without it, a slow `grim`/`screencapture` would spawn a growing queue of subprocesses.
@@ -309,12 +313,13 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                 if capturing && due && !capture_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     last_capture = Some(std::time::Instant::now());
                     let layout = st.layout.clone();
+                    let zoom = capture_zoom;
                     let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
                     let sink = sink.clone();
                     let busy = capture_busy.clone();
                     tokio::spawn(async move {
                         let frame = tokio::task::spawn_blocking(move || {
-                            capture::capture_around(x, y, &layout, dryrun)
+                            capture::capture_around(x, y, zoom, &layout, dryrun)
                         })
                         .await
                         .unwrap_or(None);
@@ -380,6 +385,19 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
             // on the next loop iteration.
             "capture" => {
                 capturing = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
+                // Carried on the same message so a fresh drag immediately uses the zoom level
+                // from last time, without waiting for a pinch to happen mid-drag.
+                if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
+                    capture_zoom = capture::clamp_zoom(z as f32);
+                }
+            }
+            // Pinch-to-zoom, live, while already dragging. Re-validated here rather than
+            // trusted from the wire — the client decides the number, the daemon decides what a
+            // shell-out is allowed to ask a screenshot tool for.
+            "capture_zoom" => {
+                if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
+                    capture_zoom = capture::clamp_zoom(z as f32);
+                }
             }
             // Push-to-talk pressed. `rate` is whatever the phone's AudioContext gave us; the
             // engine resamples. A second start without a stop just replaces the utterance.

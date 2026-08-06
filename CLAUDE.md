@@ -142,6 +142,22 @@ real cursor. Two different bugs:
 - **No auth gate on this** (see "Open threads" — it was already the top-priority gap for input;
   this adds live screen contents to what an unauthenticated LAN client can pull).
 
+**Capture zoom BUILT.** Real-hardware feedback after the geometry fixes above: positionally
+accurate now, but the fixed 480×300 crop is too tight to see much around the cursor. Fix scales
+the *captured region size*, not the image — `object-fit: cover` on `#padcap` already stretches
+whatever arrives to fill the pad, so a bigger region reads as zoomed-out with zero client-side
+rendering work. `capture::clamp_zoom` clamps to `[0.5, 4.0]` and is re-validated server-side even
+though the client also clamps, since the daemon is what turns the number into a shell-out.
+Control is the two-finger touch that was previously read only for the tap-vs-right-click
+decision at touchend: mid-drag, pinching fingers together grows the region (zoom out, more
+desktop), spreading them shrinks it (zoom in, precision) — `pinchStartDist`/`pinchStartZoom` in
+`app.js` capture the ratio at the start of each pinch so it's relative, not absolute. Persisted
+in `localStorage` (`remoat.zoom`) and sent as `{type:"capture",on:true,zoom}` on touchstart, live
+changes as a separate `{type:"capture_zoom",zoom}` throttled through the existing rAF
+`schedule()`/`flush()` so a fast pinch doesn't flood the socket. A crossing mid-drag carries the
+current zoom to the new device the same way it already carries `capturing`. 101 unit tests
+(3 new, for zoom clamping/scaling), 20 JS tests.
+
 **Local streaming speech-to-text BUILT** (`src/stt.rs`, `web/pcm-worklet.js`) — and unlike the
 capture feature, this one is **verified end-to-end on real audio through a real browser**.
 - **Why a streaming transducer and not Whisper.** Live typing while you speak is a hard
@@ -356,12 +372,12 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   argv is untested, and hypridle only honours logind inhibitors when
   `ignore_dbus_inhibit=false` (its default). `wlinhibit` is the no-logind fallback and is the
   one path with no pid leash, so it leans on the SIGTERM handler alone.
-- **Touchpad capture (`src/capture.rs`) is entirely unverified on real hardware** — built and
-  argv-checked from a cloud session with no display. On Linux, confirm `grim` actually captures
-  under Hyprland from this daemon (not just from a terminal) and that `-g` geometry syntax is
-  still correct for the installed grim version. Also unverified: whether 8fps/480×300 is
-  remotely the right tradeoff for real Wi-Fi + a real screenshot's actual latency —
-  CAPTURE_INTERVAL and the crop size are guesses, not measurements.
+- **Touchpad capture confirmed positionally accurate on real macOS hardware** (2026-08-06,
+  informal — "a lot more positionally accurate", no further detail given). Zoom is now
+  user-adjustable so the 480×300 default matters less, but CAPTURE_INTERVAL is still a guess,
+  not a measurement. **Linux is still entirely unverified** — no Linux box has run this build.
+  Confirm `grim` actually captures under Hyprland from this daemon (not just from a terminal)
+  and that `-g` geometry syntax is still correct for the installed grim version.
 - **macOS permissions: Screen Recording CONFIRMED to fail LOUD; Accessibility fails in
   ABSOLUTE SILENCE, and that silence is structural, not a logging gap.** `screencapture` without
   Screen Recording permission prints its own error (`cannot create image…`) to stderr; without
@@ -395,6 +411,14 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   that the daemon runs from **Kitty** (`net.kovidgoyal.kitty`, itself a nix store path — same
   rotation problem as remoat's own binary), confirmed for Screen Recording; Accessibility could
   never be confirmed via log at all, which is the whole point above.
+- **Actual resolution, reported 2026-08-06: running the daemon from macOS's native Terminal.app
+  (not Kitty, not via `nix run` invoked from Kitty) and granting permissions there fixed cursor
+  movement.** This sidesteps rather than confirms the `check_accessibility_trust` diagnosis above
+  — the user moved on ("Whatever") before the mechanism was pinned down, so the dead ends above
+  are still real (they cost real rounds) but the underlying *why* is still open. One correction
+  from mid-investigation is worth keeping regardless of root cause: **don't assume an external
+  cause (nix ad-hoc signing was proposed here and was wrong) — check whether anything in the
+  actual recent commits could have caused a regression before reaching for one.**
 - Screen capture currently ships with **no auth**, same LAN-exposure gap as input (see the
   security item above) — now covering live screen contents too, not just injection.
 

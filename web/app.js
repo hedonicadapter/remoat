@@ -21,6 +21,8 @@ import {
   const TILE_TAP_SLOP = 8; // tile drag vs tap
   const LAYOUT_KEY = "remoat.layout";
   const ACTIVE_KEY = "remoat.active";
+  const ZOOM_KEY = "remoat.zoom";
+  const ZOOM_MIN = 0.5, ZOOM_MAX = 4.0;   // mirrors capture::ZOOM_MIN/MAX — server re-clamps anyway
 
   const $ = (id) => document.getElementById(id);
   const pad = $("pad"), padcap = $("padcap"), statusDot = $("status"), toast = $("toast");
@@ -33,10 +35,14 @@ import {
   let activeId = localStorage.getItem(ACTIVE_KEY) || null;
   let originId = null;         // the daemon serving this page
   let cursor = null;           // {id, gx, gy, overshoot}
+  let zoom = loadZoom();       // capture region multiplier: >1 = more desktop visible, <1 = precision
 
   function loadLayout() {
     try { return JSON.parse(localStorage.getItem(LAYOUT_KEY)) || {}; } catch (_) { return {}; }
   }
+  function clampZoom(z) { return Number.isFinite(z) ? Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z)) : 1; }
+  function loadZoom() { return clampZoom(parseFloat(localStorage.getItem(ZOOM_KEY))); }
+  function saveZoom() { localStorage.setItem(ZOOM_KEY, String(zoom)); }
   function saveLayout() {
     localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
   }
@@ -171,7 +177,7 @@ import {
     // Capture follows it too — a crossing mid-drag must keep streaming from the new device.
     if (capturing) {
       if (prev) sendTo(prev, { type: "capture", on: false });
-      sendTo(id, { type: "capture", on: true });
+      sendTo(id, { type: "capture", on: true, zoom });
     }
     padcap.classList.remove("show");   // last frame belonged to the device we just left
     const d = devices.get(id);
@@ -339,6 +345,7 @@ import {
   let maxTouches = 0, moved = false, pendDx = 0, pendDy = 0, scrollAccX = 0, scrollAccY = 0, rafPending = false;
   let blockedAt = 0;
   let capturing = false;   // requesting live capture frames from the active device while dragging
+  let pinchStartDist = 0, pinchStartZoom = 1, zoomDirty = false;   // two-finger pinch-to-zoom
 
   function flush() {
     rafPending = false;
@@ -349,6 +356,10 @@ import {
     if (Math.abs(scrollAccX) >= 1 || Math.abs(scrollAccY) >= 1) {
       sendActive({ type: "scroll", dx: Math.round(scrollAccX), dy: Math.round(scrollAccY) });
       scrollAccX = scrollAccY = 0;
+    }
+    if (zoomDirty) {
+      zoomDirty = false;
+      sendActive({ type: "capture_zoom", zoom });
     }
   }
   function schedule() { if (!rafPending) { rafPending = true; requestAnimationFrame(flush); } }
@@ -388,8 +399,14 @@ import {
     startT = e.timeStamp; moved = false;
     maxTouches = e.touches.length;
     capturing = true;
-    sendActive({ type: "capture", on: true });
+    pinchStartDist = 0;
+    sendActive({ type: "capture", on: true, zoom });
   }, { passive: false });
+
+  function pinchDist(touches) {
+    const [a, b] = touches;
+    return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+  }
 
   pad.addEventListener("touchmove", (e) => {
     e.preventDefault();
@@ -398,7 +415,19 @@ import {
     const dx = t.clientX - lastX, dy = t.clientY - lastY;
     lastX = t.clientX; lastY = t.clientY;
     if (Math.abs(t.clientX - startX) > TAP_SLOP || Math.abs(t.clientY - startY) > TAP_SLOP) moved = true;
-    if (e.touches.length < 2) {
+    if (e.touches.length >= 2) {
+      // Pinch together = zoom out (bigger region, more desktop); pinch apart = zoom in (precision).
+      moved = true;
+      const dist = pinchDist(e.touches);
+      if (pinchStartDist === 0) {
+        pinchStartDist = dist;
+        pinchStartZoom = zoom;
+      } else if (dist > 0) {
+        const z = clampZoom(pinchStartZoom * (pinchStartDist / dist));
+        if (z !== zoom) { zoom = z; saveZoom(); zoomDirty = true; }
+      }
+    } else {
+      pinchStartDist = 0;
       pendDx += dx * SENS; pendDy += dy * SENS;   // single finger = cursor (scroll lives on the bars)
     }
     schedule();
@@ -412,6 +441,7 @@ import {
       sendActive({ type: "click", button: maxTouches >= 2 ? "right" : "left" });
     }
     maxTouches = 0;
+    pinchStartDist = 0;
     capturing = false;
     sendActive({ type: "capture", on: false });
   }, { passive: false });

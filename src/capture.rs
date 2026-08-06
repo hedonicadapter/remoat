@@ -21,9 +21,25 @@ use std::process::Command;
 
 use crate::screen::{Layout, Rect};
 
-/// Crop size around the cursor, in logical pixels. `REMOAT_CAPTURE_SIZE=WxH` overrides.
+/// Crop size around the cursor at zoom 1.0, in logical pixels. `REMOAT_CAPTURE_SIZE=WxH`
+/// overrides.
 const DEFAULT_W: i32 = 480;
 const DEFAULT_H: i32 = 300;
+
+/// Pinch-to-zoom range. Above 1 shows more desktop (a bigger region, scaled down into the same
+/// on-screen box by the client's `object-fit: cover`); below 1 shows less, for precision work.
+/// Clamped here too, not just client-side — a client is what decides the number, but the
+/// daemon is what turns it into a shell-out, so it re-validates rather than trusting the wire.
+pub const ZOOM_MIN: f32 = 0.5;
+pub const ZOOM_MAX: f32 = 4.0;
+
+pub fn clamp_zoom(z: f32) -> f32 {
+    if z.is_finite() {
+        z.clamp(ZOOM_MIN, ZOOM_MAX)
+    } else {
+        1.0
+    }
+}
 
 fn capture_size() -> (i32, i32) {
     if let Ok(v) = std::env::var("REMOAT_CAPTURE_SIZE") {
@@ -36,6 +52,17 @@ fn capture_size() -> (i32, i32) {
         }
     }
     (DEFAULT_W, DEFAULT_H)
+}
+
+/// Region of `size` centered on a desktop-local cursor position, translated into compositor
+/// logical coordinates and confined to whichever monitor holds the cursor. `zoom` scales the
+/// base crop size before any of that — everything downstream (the monitor clamp, the
+/// shrink-to-fit) already handles an oversized request, since it was already built for a
+/// crop bigger than a small or mismatched monitor.
+pub fn region_around_zoomed(cx: i32, cy: i32, base: (i32, i32), zoom: f32, layout: &Layout) -> Rect {
+    let z = clamp_zoom(zoom);
+    let size = (((base.0 as f32) * z).round() as i32, ((base.1 as f32) * z).round() as i32);
+    region_around(cx, cy, size, layout)
 }
 
 /// Region of `size` centered on a desktop-local cursor position, translated into compositor
@@ -65,10 +92,11 @@ pub fn region_around(cx: i32, cy: i32, size: (i32, i32), layout: &Layout) -> Rec
     }
 }
 
-/// Capture the region around a desktop-local (cx, cy). `None` means the shell-out failed, the
-/// tool was missing, or this was a dry run — the caller just skips sending a frame.
-pub fn capture_around(cx: i32, cy: i32, layout: &Layout, dryrun: bool) -> Option<Vec<u8>> {
-    platform_capture(region_around(cx, cy, capture_size(), layout), dryrun)
+/// Capture the region around a desktop-local (cx, cy) at the given zoom. `None` means the
+/// shell-out failed, the tool was missing, or this was a dry run — the caller just skips
+/// sending a frame.
+pub fn capture_around(cx: i32, cy: i32, zoom: f32, layout: &Layout, dryrun: bool) -> Option<Vec<u8>> {
+    platform_capture(region_around_zoomed(cx, cy, capture_size(), zoom, layout), dryrun)
 }
 
 #[cfg(target_os = "macos")]
@@ -223,5 +251,35 @@ mod tests {
         assert_eq!(region_around(0, 540, (480, 300), &l), rect(-1920, 390, 480, 300));
         // Local 1920 is the second monitor's left edge.
         assert_eq!(region_around(1920, 540, (480, 300), &l), rect(0, 390, 480, 300));
+    }
+
+    #[test]
+    fn zoom_scales_the_base_size_before_the_monitor_clamp() {
+        let l = single(1920, 1080);
+        assert_eq!(region_around_zoomed(960, 540, (480, 300), 1.0, &l), rect(720, 390, 480, 300));
+        // 2x zoom out: double each dimension, still centered.
+        assert_eq!(region_around_zoomed(960, 540, (480, 300), 2.0, &l), rect(480, 240, 960, 600));
+        // 0.5x zoom in: half each dimension.
+        assert_eq!(region_around_zoomed(960, 540, (480, 300), 0.5, &l), rect(720 + 120, 390 + 75, 240, 150));
+    }
+
+    #[test]
+    fn zoom_is_clamped_both_at_the_edges_and_against_garbage() {
+        assert_eq!(clamp_zoom(0.1), ZOOM_MIN);
+        assert_eq!(clamp_zoom(50.0), ZOOM_MAX);
+        assert_eq!(clamp_zoom(1.0), 1.0);
+        // A malformed or absent value from the wire must not panic or produce a 0x0 region.
+        assert_eq!(clamp_zoom(f32::NAN), 1.0);
+        assert_eq!(clamp_zoom(f32::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn a_zoomed_out_crop_still_shrinks_to_fit_a_small_monitor() {
+        // Zooming out past what a monitor can show must not ask grim/screencapture for a
+        // region bigger than the screen — region_around already clamps this; zoom must not
+        // bypass it.
+        let l = single(600, 400);
+        let r = region_around_zoomed(300, 200, (480, 300), 4.0, &l);
+        assert_eq!(r, rect(0, 0, 600, 400));
     }
 }
