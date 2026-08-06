@@ -112,6 +112,37 @@ enum SttMode {
 /// The write half, shared between the receive loop and detached tasks (capture frames).
 type Sink = Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>;
 
+/// Fire a capture at `(x, y)` and push the frame back, detached so a slow screenshot never
+/// blocks the receive loop. Shared by `move_abs` (every drag step) and `capture_zoom` (a pinch
+/// alone sends no `move_abs`, so without this the crop would never visibly resize mid-pinch).
+fn spawn_capture(
+    x: i32,
+    y: i32,
+    zoom: f32,
+    layout: Arc<screen::Layout>,
+    dryrun: bool,
+    sink: Sink,
+    last_capture: &mut Option<std::time::Instant>,
+    capture_busy: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use futures_util::SinkExt;
+    let due = last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true);
+    if !due || capture_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    *last_capture = Some(std::time::Instant::now());
+    let busy = capture_busy.clone();
+    tokio::spawn(async move {
+        let frame = tokio::task::spawn_blocking(move || capture::capture_around(x, y, zoom, &layout, dryrun))
+            .await
+            .unwrap_or(None);
+        busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(bytes) = frame {
+            let _ = sink.lock().await.send(Message::Binary(bytes)).await;
+        }
+    });
+}
+
 /// Interleaved 16-bit little-endian PCM -> f32 in [-1, 1). i16 rather than f32 on the wire
 /// halves the uplink for no audible cost at 16 kHz mono, and it is what the AudioWorklet sends.
 /// A trailing odd byte (a split frame) is dropped rather than misread as a sample.
@@ -238,6 +269,9 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
     // reconnect only as far as the client re-sends it; the server holds no history of it.
     let mut capture_zoom: f32 = 1.0;
     let mut last_capture: Option<std::time::Instant> = None;
+    // Last position a capture was centered on — a pinch alone sends no move_abs, so
+    // `capture_zoom` needs this to know where to re-capture.
+    let mut last_xy: Option<(i32, i32)> = None;
     // Guards against piling up captures if a screenshot takes longer than CAPTURE_INTERVAL —
     // without it, a slow `grim`/`screencapture` would spawn a growing queue of subprocesses.
     let capture_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -303,31 +337,17 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                 let home = v.get("home").and_then(|x| x.as_bool()).unwrap_or(false);
                 let (x, y) = st.layout.bounds.clamp(x, y);
                 let _ = st.tx.send(InputCmd::MoveAbs { x, y, home });
+                last_xy = Some((x, y));
 
                 // Piggyback the capture frame on the move itself — the crop is centered on
                 // exactly this position, and the drag already produces these messages at a
-                // steady rate, so there's no separate timer to drift out of sync. Spawned
-                // detached (not awaited here) so a slow screenshot never delays the NEXT
-                // move_abs from reaching the input worker.
-                let due = last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true);
-                if capturing && due && !capture_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    last_capture = Some(std::time::Instant::now());
-                    let layout = st.layout.clone();
-                    let zoom = capture_zoom;
+                // steady rate, so there's no separate timer to drift out of sync.
+                if capturing {
                     let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
-                    let sink = sink.clone();
-                    let busy = capture_busy.clone();
-                    tokio::spawn(async move {
-                        let frame = tokio::task::spawn_blocking(move || {
-                            capture::capture_around(x, y, zoom, &layout, dryrun)
-                        })
-                        .await
-                        .unwrap_or(None);
-                        busy.store(false, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(bytes) = frame {
-                            let _ = sink.lock().await.send(Message::Binary(bytes)).await;
-                        }
-                    });
+                    spawn_capture(
+                        x, y, capture_zoom, st.layout.clone(), dryrun, sink.clone(),
+                        &mut last_capture, &capture_busy,
+                    );
                 }
             }
             "click" => {
@@ -397,6 +417,17 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
             "capture_zoom" => {
                 if let Some(z) = v.get("zoom").and_then(|x| x.as_f64()) {
                     capture_zoom = capture::clamp_zoom(z as f32);
+                    // A pinch alone sends no move_abs, so without this the resized crop would
+                    // never actually reach the phone until the next single-finger drag step.
+                    if capturing {
+                        if let Some((x, y)) = last_xy {
+                            let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
+                            spawn_capture(
+                                x, y, capture_zoom, st.layout.clone(), dryrun, sink.clone(),
+                                &mut last_capture, &capture_busy,
+                            );
+                        }
+                    }
                 }
             }
             // Push-to-talk pressed. `rate` is whatever the phone's AudioContext gave us; the
