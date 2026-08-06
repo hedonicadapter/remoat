@@ -180,6 +180,44 @@ the daemon, not the gesture:
   handlers; no `stopPropagation` needed because hit-testing routes the tap to whichever element
   is actually on top, and the buttons aren't in `#pad`'s subtree at all.
 
+Second real-hardware report ("pinching does nothing on macOS"), and the cause was NOT in the
+gesture, the daemon, or macOS. **All three zoom commits were sitting on
+`claude/touchpad-cursor-background-3qtnua`, never merged to `main`** — and
+`nix run github:hedonicadapter/remoat` resolves the DEFAULT branch. So the reported daemon was
+built from a `main` containing no `capture_zoom` handler at all, and — because the daemon also
+*serves the PWA* (`REMOAT_WEB_DIR`) — the phone was handed `main`'s `web/app.js`, which has no
+pinch handler either. Nothing was broken; the code simply wasn't there. **Generalise this: the
+phone's client code ships with the daemon, so an un-merged branch means BOTH halves silently
+revert, and a client-side feature can look "implemented but dead" with no error anywhere.** Check
+`git log origin/main --oneline` for the feature before debugging a "does nothing" report against
+`nix run`.
+
+Two real defects found while verifying it, both now fixed and both measured rather than reasoned:
+- **The pinch saturated its own range almost immediately.** `zoom = startZoom * (startDist/dist)`
+  is the standard ratio mapping, but a pinch's distance ratio easily reaches 5-10x while the
+  useful zoom range is only 8x end to end — so the gesture hit a clamp and went dead. Measured in
+  Chromium at iPhone 13 size, fingers starting 40px apart: the entire magnify range was spent in
+  **80px of travel and the next 120px did nothing**. Damped with `PINCH_GAIN = 0.6`
+  (`zoom = startZoom * ratio^0.6`), which spreads the same range over 160px in graduated steps
+  and keeps the no-jump property (ratio 1 to any power is still 1, so the first touchmove of a
+  pinch never moves the zoom).
+- **The 120ms `CAPTURE_INTERVAL` was eating the END of every pinch.** The client sends a
+  `capture_zoom` per animation frame (~16ms) and stops the instant the fingers lift, so the final
+  value — the one the user actually chose — was the most likely of all to be rate-limited away,
+  leaving the crop a step or two behind the gesture. `spawn_capture` gained an `urgent` flag that
+  skips the interval but never the `capture_busy` overlap guard: `move_abs` passes `false` (a long
+  drag still wants its frame rate capped), `capture`/`capture_zoom` pass `true` (a pinch is short
+  and its endpoint is the whole point, so pacing it by actual screenshot latency is correct).
+
+Verified end-to-end against the REAL daemon (`REMOAT_BACKEND=null REMOAT_DRYRUN=1
+REMOAT_SCREEN=1800x1169`) driven by real Chromium touch events over real WSS — the dry-run
+`grim` geometry stepped `480x300` (baseline drag) → `379x237` → `321x200` → `281x176` →
+`252x158` → `240x150` (the 0.5 clamp) on a pinch apart, then back out through `630x394` on a
+pinch together. That is the client gesture, the WS message, the server clamp, the region maths
+and the shell-out argv all confirmed in one path. **Still NOT confirmed: a real iPhone and a real
+macOS `screencapture`.** Chromium mobile emulation is not iOS Safari, and dry-run argv is not a
+screenshot — the standing rule in Gotchas applies.
+
 **Local streaming speech-to-text BUILT** (`src/stt.rs`, `web/pcm-worklet.js`) — and unlike the
 capture feature, this one is **verified end-to-end on real audio through a real browser**.
 - **Why a streaming transducer and not Whisper.** Live typing while you speak is a hard
@@ -609,6 +647,11 @@ Where the implementation deviates from the original design note:
 - **`Cargo.lock` must be committed** — `buildRustPackage` uses `cargoLock.lockFile`.
 - **nix flakes only see git-tracked files**; **`nix run github:` caches ~1h** → use
   `--refresh` after pushing.
+- **`nix run github:owner/repo` builds the DEFAULT branch, and the daemon serves the PWA** — so a
+  feature left on an unmerged branch takes the *client* half down with it. A pinch handler that
+  only exists on a branch produces no error, no log line, and no missing-feature hint: the phone
+  is simply served an older `app.js`. Cost a whole debugging session; check
+  `git log origin/main --oneline` before believing a "does nothing" report.
 - **Certs in `$XDG_STATE_HOME/remoat`** (writable), not the read-only nix store.
 - **Phone mic/Web-Speech need a secure context** → HTTPS is mandatory (self-signed cert).
 - **ydotool is two parts**: `ydotoold` (daemon, owns socket + uinput) + `ydotool` (client);

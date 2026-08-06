@@ -115,6 +115,13 @@ type Sink = Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Me
 /// Fire a capture at `(x, y)` and push the frame back, detached so a slow screenshot never
 /// blocks the receive loop. Shared by `move_abs` (every drag step) and `capture_zoom` (a pinch
 /// alone sends no `move_abs`, so without this the crop would never visibly resize mid-pinch).
+///
+/// `urgent` skips the CAPTURE_INTERVAL rate limit (never the `capture_busy` overlap guard). A
+/// zoom change needs it: the client sends one per animation frame (~16ms) and stops the instant
+/// the fingers lift, so with a 120ms limit the LAST value of a pinch is the one most likely to
+/// be dropped — leaving the crop a step or two behind where the gesture actually ended. The
+/// limit exists to cap the frame rate of a long drag; a pinch is short and its endpoint is the
+/// whole point, so paced by `capture_busy` alone is the right trade there.
 fn spawn_capture(
     x: i32,
     y: i32,
@@ -124,9 +131,10 @@ fn spawn_capture(
     sink: Sink,
     last_capture: &mut Option<std::time::Instant>,
     capture_busy: &Arc<std::sync::atomic::AtomicBool>,
+    urgent: bool,
 ) {
     use futures_util::SinkExt;
-    let due = last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true);
+    let due = urgent || last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true);
     if !due || capture_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -346,7 +354,7 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                     let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
                     spawn_capture(
                         x, y, capture_zoom, st.layout.clone(), dryrun, sink.clone(),
-                        &mut last_capture, &capture_busy,
+                        &mut last_capture, &capture_busy, false,
                     );
                 }
             }
@@ -424,7 +432,7 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                         let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
                         spawn_capture(
                             x, y, capture_zoom, st.layout.clone(), dryrun, sink.clone(),
-                            &mut last_capture, &capture_busy,
+                            &mut last_capture, &capture_busy, true,
                         );
                     }
                 }
@@ -448,7 +456,7 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                             let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
                             spawn_capture(
                                 x, y, capture_zoom, st.layout.clone(), dryrun, sink.clone(),
-                                &mut last_capture, &capture_busy,
+                                &mut last_capture, &capture_busy, true,
                             );
                         }
                     }

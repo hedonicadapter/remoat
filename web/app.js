@@ -23,6 +23,7 @@ import {
   const ACTIVE_KEY = "remoat.active";
   const ZOOM_KEY = "remoat.zoom";
   const ZOOM_MIN = 0.5, ZOOM_MAX = 4.0;   // mirrors capture::ZOOM_MIN/MAX — server re-clamps anyway
+  const PINCH_GAIN = 0.6;  // <1 damps the pinch ratio; see the touchmove handler for why
 
   const $ = (id) => document.getElementById(id);
   const pad = $("pad"), padcap = $("padcap"), statusDot = $("status"), toast = $("toast");
@@ -437,7 +438,14 @@ import {
         pinchStartDist = dist;
         pinchStartZoom = zoom;
       } else if (dist > 0) {
-        const z = clampZoom(pinchStartZoom * (pinchStartDist / dist));
+        // Damped, not raw ratio. A pinch's distance ratio easily reaches 5-10x, while the
+        // useful zoom range is only 8x end to end (0.5..4.0) — so an undamped ratio slams into
+        // a clamp almost immediately and the rest of the gesture is dead. Measured on an
+        // iPhone-sized pad, fingers starting 40px apart: undamped, the whole magnify range was
+        // spent in 80px of travel and the next 120px did nothing. PINCH_GAIN < 1 spreads the
+        // range over a pinch you'd actually make, and dist == pinchStartDist still means "no
+        // change" (ratio 1 to any power is 1), so there's no jump on the first move.
+        const z = clampZoom(pinchStartZoom * Math.pow(pinchStartDist / dist, PINCH_GAIN));
         if (z !== zoom) { zoom = z; saveZoom(); zoomDirty = true; }
       }
     } else {
