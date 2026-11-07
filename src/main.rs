@@ -2,18 +2,11 @@
 //!
 //! Protocol:
 //!   client -> server (JSON): {type:"hello"|"move"|"move_abs"|"click"|"scroll"|"text"
-//!                                 |"command"|"wake"|"capture"|"stt_start"|"stt_stop"|"ping", …}
+//!                                 |"command"|"wake"|"stt_start"|"stt_stop"|"ping", …}
 //!   client -> server (binary): microphone PCM (16-bit LE mono) between stt_start and stt_stop.
 //!                              The mic is on the phone; the model runs here (see stt.rs).
 //!   server -> client (JSON): {type:"devices"|"screen"|"command_result"|"wake_state"
 //!                                 |"stt_partial"|"pong", …}
-//!   server -> client (binary): a PNG crop of the desktop around the cursor, sent while a
-//!                              client has capture on (see capture.rs) — throttled to
-//!                              CAPTURE_INTERVAL and driven off move_abs, so it needs no
-//!                              timer of its own.
-//!
-//! Both directions use binary frames, disambiguated by direction alone: up is audio, down is
-//! a screen crop.
 //!
 //! Dictation is typed by the DAEMON, not the phone: with local STT the transcript lives here,
 //! so the running-transcript diff that used to run in app.js runs in `emit_transcript`. The
@@ -21,7 +14,6 @@
 
 mod actions;
 mod apps;
-mod capture;
 mod commands;
 mod config;
 mod discovery;
@@ -59,8 +51,7 @@ struct AppState {
     tx: UnboundedSender<InputCmd>,
     disc: Arc<Discovery>,
     wake: Arc<WakeLock>,
-    /// Desktop union + its individual monitors. Capture needs the monitors (a crop must stay
-    /// inside one output), so the whole layout is carried, not just the bounds.
+    /// Desktop union (what incoming `move_abs` is clamped into).
     layout: Arc<screen::Layout>,
     /// Local streaming STT, or None when no model is installed — in which case the client is
     /// told so and keeps using the browser's Web Speech API.
@@ -72,11 +63,6 @@ struct AppState {
 /// focused and heartbeats to keep it; a pocketed phone whose socket never closes (dropped
 /// Wi-Fi, killed tab) must not pin the display on indefinitely.
 const WAKE_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
-
-/// Minimum gap between capture frames per connection. Shelling out to a screenshot tool on
-/// every touchmove would be ~60 spawns/sec; this caps it to a still-live-feeling ~8fps.
-/// Picked, not measured — no real hardware to profile against from this dev environment.
-const CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 
 fn web_dir() -> String {
     std::env::var("REMOAT_WEB_DIR").unwrap_or_else(|_| "web".into())
@@ -108,7 +94,8 @@ enum SttMode {
     Command,
 }
 
-/// The write half, shared between the receive loop and detached tasks (capture frames).
+/// The write half of the socket, shared so replies can be sent from helpers (`run_command`,
+/// `emit_transcript`) without threading the whole socket through.
 type Sink = Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Message>>>;
 
 /// Interleaved 16-bit little-endian PCM -> f32 in [-1, 1). i16 rather than f32 on the wire
@@ -210,10 +197,7 @@ async fn run_command(st: &AppState, sink: &Sink, t: &str) {
 }
 
 async fn handle_socket(socket: WebSocket, st: AppState) {
-    // Split so a slow capture (a subprocess screenshot can take well over one frame) never
-    // blocks the receive loop below it — otherwise every touchmove queued behind an in-flight
-    // capture would stall the cursor itself, not just the image. The sink is shared because
-    // both the loop (JSON replies) and detached capture tasks (binary frames) write to it.
+    // Split into a receive-only stream and a shared sink so replies never block reads.
     use futures_util::{SinkExt, StreamExt};
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(tokio::sync::Mutex::new(sink));
@@ -231,12 +215,6 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
 
     // At most one wake reference per connection, released on blur, idle, or disconnect.
     let mut holding = false;
-    // Capture streaming: on only while this client is actively dragging (see "capture" below).
-    let mut capturing = false;
-    let mut last_capture: Option<std::time::Instant> = None;
-    // Guards against piling up captures if a screenshot takes longer than CAPTURE_INTERVAL —
-    // without it, a slow `grim`/`screencapture` would spawn a growing queue of subprocesses.
-    let capture_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The in-flight dictation, if this client is holding push-to-talk. `None` between presses.
     let mut utter: Option<stt::Utterance> = None;
     let mut utter_mode = SttMode::Type;
@@ -299,31 +277,6 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                 let home = v.get("home").and_then(|x| x.as_bool()).unwrap_or(false);
                 let (x, y) = st.layout.bounds.clamp(x, y);
                 let _ = st.tx.send(InputCmd::MoveAbs { x, y, home });
-
-                // Piggyback the capture frame on the move itself — the crop is centered on
-                // exactly this position, and the drag already produces these messages at a
-                // steady rate, so there's no separate timer to drift out of sync. Spawned
-                // detached (not awaited here) so a slow screenshot never delays the NEXT
-                // move_abs from reaching the input worker.
-                let due = last_capture.map(|t| t.elapsed() >= CAPTURE_INTERVAL).unwrap_or(true);
-                if capturing && due && !capture_busy.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    last_capture = Some(std::time::Instant::now());
-                    let layout = st.layout.clone();
-                    let dryrun = std::env::var("REMOAT_DRYRUN").is_ok();
-                    let sink = sink.clone();
-                    let busy = capture_busy.clone();
-                    tokio::spawn(async move {
-                        let frame = tokio::task::spawn_blocking(move || {
-                            capture::capture_around(x, y, &layout, dryrun)
-                        })
-                        .await
-                        .unwrap_or(None);
-                        busy.store(false, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(bytes) = frame {
-                            let _ = sink.lock().await.send(Message::Binary(bytes)).await;
-                        }
-                    });
-                }
             }
             "click" => {
                 let button = v.get("button").and_then(|x| x.as_str()).unwrap_or("left").to_string();
@@ -374,12 +327,6 @@ async fn handle_socket(socket: WebSocket, st: AppState) {
                             .to_string(),
                     ))
                     .await;
-            }
-            // The phone requests frames only while it's actively dragging — on:false both
-            // stops new spawns and lets `capturing` gate out any in-flight straggler's effect
-            // on the next loop iteration.
-            "capture" => {
-                capturing = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
             }
             // Push-to-talk pressed. `rate` is whatever the phone's AudioContext gave us; the
             // engine resamples. A second start without a stop just replaces the utterance.

@@ -57,93 +57,37 @@ appears/disappears with focus, survives one of two clients leaving, and is relea
 close, abrupt socket drop, 90s client silence, SIGTERM **and SIGKILL**. Linux inhibitor
 argv is unexercised (no Linux box) — see "Open threads".
 
-**Touchpad live capture BUILT** (`src/capture.rs`), from a cloud session with no display —
-verified by `cargo build`/`cargo test` (region-clamping math + argv construction only, same
-honesty as the ydotool dry-run caveat below) and by inspecting rendered WS traffic logic, NOT
-by watching a real phone show a real screen. Treat platform capture as unexercised until
-someone confirms it on hardware.
-- The touchpad background used to be a CSS glow at the cursor's relative position; it's now a
-  live PNG crop of the actual desktop around the cursor (`#padcap` in `web/app.js`), because a
-  glow doesn't answer "what's actually under my finger right now."
-- **Shells out to a platform screenshot tool, same pattern as ydotool for input**: `screencapture`
-  on macOS, `grim` on Linux (wlr-screencopy — works on Hyprland and other wlroots compositors,
-  NOT a portal flow, so no per-frame permission dialog). `grim` is in the flake's Linux
-  `runtimeTools`; `screencapture` is a macOS system binary, nothing to add.
-- **Driven off `move_abs`, not its own timer.** The client sends `{type:"capture",on:true}` on
-  touchstart / `false` on touchend (mirrors the wake-lock on/off pattern); while on, the daemon
-  captures a crop centered on the position it *just moved to* and pushes it back as a binary WS
-  frame, throttled to `CAPTURE_INTERVAL` (120ms, ~8fps — picked, not profiled). A crossing
-  mid-drag moves the capture request to the new active device the same way it moves the wake
-  lock (`setActive` in `app.js`).
-- Crop size defaults to 480×300, overridable with `REMOAT_CAPTURE_SIZE=WxH` (mirrors
-  `REMOAT_SCREEN`). Region math shrinks-and-clamps to fit inside the actual desktop bounds.
+**Touchpad live capture REMOVED** (2026-11-07). The PWA briefly showed a live PNG crop of the
+desktop around the cursor (`src/capture.rs`, `#padcap`, the `capture` WS message, binary frames
+downstream, `grim`/`screencapture` shell-outs, `REMOAT_CAPTURE_SIZE`). All of it is gone: the
+daemon no longer screenshots anything, `grim` is out of the flake's `runtimeTools`, and the only
+binary WS frames are now mic PCM going up. The touchpad background is a plain pad again.
+Lessons it produced that still apply (they are about geometry and pointer modelling, not about
+screenshots):
+- **`screen.rs` must report the LOGICAL desktop.** Building it found three stacked bugs: no niri
+  support (`hyprctl` → `wlr-randr` → `xrandr` all missed, so a 3840x1080 desktop silently became
+  the 1920x1080 FALLBACK — and `wlr-randr` was never on PATH); physical mode sizes paired with
+  logical positions (a scale-2 4K panel inflated the union to 5760x2160); and an origin assumed
+  at 0,0. niri is now queried first via `niri msg --json outputs`, both other parsers divide by
+  `scale` (and swap axes on 90°/270°), and `Bounds` carries `ox`/`oy`. 50 unit tests including
+  the mixed-scale JSON for all three parsers. See "Screen geometry" in Gotchas.
+- **Never await a subprocess inline in the per-connection WS loop.** The first cut did, and
+  every touchmove queued behind an in-flight screenshot, stalling the cursor itself. The socket
+  is split into a shared `Arc<Mutex<SplitSink>>` and a receive-only stream; that split stays,
+  since STT replies use it too.
+- **Flat pointer accel is a hard requirement for an exact model on Linux, and that is a design
+  flaw, not a setting.** The crop made this visible: it was centred on where the daemon
+  *believes* the pointer is, and with relative injection under libinput's adaptive profile the
+  real pointer drifts hundreds of px from that model mid-screen. Worked example on a 3840x1080
+  desktop: `placeCursor` centres at (1920,540) with `home:true`, `home_corner` slams to
+  (3839,1079), then walks `dx = -1919` — accel amplifies a delta that large, so the pointer
+  overshoots left. **Homing does not fix this** (the walk away from the corner is accelerated
+  too); the only in-design resync is a screen edge, which is why `abs_to_rel` overshoots edge
+  targets. Touching the real mouse desynchronises the model until the next `home` or edge
+  contact. The ydotool backend says so at startup. See the absolute-device item in Open threads.
 
-First real-hardware feedback (nixos): laggy, and the crop was offset well to the left of the
-real cursor. Two different bugs:
-- **The lag was real and is fixed.** The first cut awaited the capture subprocess *inline* in
-  the same per-connection loop that also reads incoming WS messages — so every touchmove sent
-  while a screenshot was mid-flight queued behind it, stalling cursor movement itself, not just
-  the image. Fixed by splitting the socket (`futures_util::StreamExt/SinkExt`) into a shared
-  `Arc<Mutex<SplitSink>>` and a receive-only stream; `move_abs` now `tokio::spawn`s the capture
-  detached and sends the frame whenever it's ready, gated by an `AtomicBool` so a slow capture
-  can't pile up a queue of overlapping subprocesses. The receive loop never waits on it.
-- **The offset + black bars were `screen.rs` reporting a desktop that doesn't exist.** Reporter
-  runs niri with a scale-1 laptop panel beside a scale-2 4K external. Three separate bugs
-  stacked up, all now fixed — see "Screen geometry" in Gotchas for the rule that prevents them:
-  1. **No niri support at all.** `platform_bounds` tried `hyprctl` → `wlr-randr` → `xrandr`;
-     under niri the first and last don't exist, and `wlr-randr` was *never in the flake's
-     `runtimeTools`* despite being referenced since the Python days. So it silently fell to the
-     1920x1080 FALLBACK on a 3840x1080 desktop. niri is now queried first via
-     `niri msg --json outputs`, whose `logical` rect is exactly right with no arithmetic.
-  2. **Physical mode sizes paired with logical positions.** Both the hyprctl and wlr-randr
-     parsers read `width`/`height` (the *physical* mode) and combined them with logical
-     positions. A 3840x2160 panel at scale 2 occupies 1920x1080 of layout, so the union
-     inflated to 5760x2160 against a real 3840x1080 — and since the phone drives the cursor
-     across the union and the crop is clamped to it, coordinates landed in space no output
-     covers. grim renders that as black. Both parsers now divide by `scale` (and swap axes on
-     a 90°/270° transform).
-  3. **Origin assumed 0,0.** A monitor placed left of or above the primary makes the layout
-     origin negative; every crop was then shifted by that whole offset. `Bounds` now carries
-     `ox`/`oy`, the phone still gets a 0-based `w`x`h`, and capture translates.
-- **Capture crops are confined to the monitor under the cursor**, not the union — a union of
-  mismatched monitors has uncovered gaps, and a crop reaching into one comes back with black
-  bars. A cursor in a gap snaps to the nearest output. This makes black bars structurally
-  impossible rather than merely unlikely.
-- Verified end-to-end on the dev box against a stand-in `niri` reporting the reporter's exact
-  arrangement, driven over real WS/TLS: union `3840x1080`, and grim geometry correct at five
-  probes including the two that used to break — a cursor 20px from the seam stays inside the
-  laptop (`1440,780 480x300`), and one *on* the seam snaps fully onto the external
-  (`1920,390 480x300`). Nothing exceeds the real bounds. 50 unit tests, including the
-  mixed-scale JSON for all three parsers (that parsing is split from the shell-out precisely so
-  it's testable without the compositor — same reason as `input.rs::keyargs`).
-- **The lag fix is measured, not assumed:** with a stand-in `grim` sleeping 600ms (5×
-  `CAPTURE_INTERVAL`), 12 pings interleaved with capture-triggering `move_abs` all answered in
-  ≤2ms while frames still arrived. Inline-awaited, they'd have queued ~600ms behind it.
-- **After the geometry fix the crop moved to the RIGHT of the cursor — that one is not geometry,
-  it's the modelled pointer position, and flat accel is a hard requirement, not a preference.**
-  The crop is centered on where the daemon *believes* the pointer is, and on Linux that is only
-  ever an estimate (nothing can read the pointer on Wayland; ydotool can't place it absolutely).
-  Worked example on a 3840x1080 desktop: the first `placeCursor` centres at local (1920,540)
-  with `home:true`, `home_corner` slams to (3839,1079), then walks `dx = -1919`. libinput's
-  default *adaptive* profile amplifies a delta that large, so the real pointer travels further
-  left than 1919 and ends up left of the believed 1920 — putting the crop to its right, by
-  roughly the amplification × the walk (hundreds of px). Direction flipped from the earlier
-  black-bar report because that one was inflated bounds, this one is drift.
-  **Homing does not fix this** — the slam pins the pointer, but the walk away from the corner is
-  accelerated too, so the error is reintroduced immediately. The ONLY in-design resync is a
-  screen edge (compositor clamping), which is exactly why `abs_to_rel` overshoots edge targets.
-  So with relative injection there is no way to be accurate mid-screen while accel is on:
-  `accel-profile "flat"` + `accel-speed 0.0` makes deltas 1:1 and the model exact. The ydotool
-  backend now says so at startup. Also worth knowing: **touching the real mouse desynchronises
-  the model permanently** (nothing reports it), until the next `home` or edge contact.
-- `grim -c` / `screencapture -C` draw the real cursor into the crop. Deliberate: while the
-  position is an estimate, seeing the cursor makes an error self-evident instead of looking like
-  the wrong region — and a centred cursor is the cheap confirmation that the estimate is exact.
-- **No auth gate on this** (see "Open threads" — it was already the top-priority gap for input;
-  this adds live screen contents to what an unauthenticated LAN client can pull).
-
-**Local streaming speech-to-text BUILT** (`src/stt.rs`, `web/pcm-worklet.js`) — and unlike the
-capture feature, this one is **verified end-to-end on real audio through a real browser**.
+**Local streaming speech-to-text BUILT** (`src/stt.rs`, `web/pcm-worklet.js`) — **verified
+end-to-end on real audio through a real browser**.
 - **Why a streaming transducer and not Whisper.** Live typing while you speak is a hard
   requirement. Whisper is batch and pads every inference to 30s, so faking partials means
   re-transcribing a growing buffer — slow and O(n²). A zipformer **transducer** (sherpa-onnx
@@ -155,8 +99,7 @@ capture feature, this one is **verified end-to-end on real audio through a real 
 - **The mic is on the phone, the model runs on the desktop.** So `cpal` is irrelevant here.
   `web/pcm-worklet.js` captures via AudioWorklet (NOT MediaRecorder — iOS emits mp4/AAC, which
   would need a decoder on the daemon), converts to Int16 in the audio thread, and posts ~100ms
-  batches that go up as WS **binary frames**. Both directions now use binary, disambiguated by
-  direction alone: up is audio, down is a screen crop.
+  batches that go up as WS **binary frames** — the only binary traffic on the socket.
 - **No `rubato`.** sherpa-onnx ships `LinearResampler`; the phone's 48kHz is converted in-engine.
   One fewer dependency than the plan called for.
 - **The daemon types, not the phone.** With a local model the transcript lives on the daemon, so
@@ -251,8 +194,9 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   (and/then/comma), repeat suffix (`twice`, `3 times`, `x4`), `{n}` count slot.
 - `src/config.rs` — command table: embedded `src/commands.default.toml` + user
   `commands.toml` merged on top, re-read on mtime change, per-rule fail-soft validation.
-- `src/screen.rs` — desktop bounds (env override → Quartz via enigo → hyprctl/wlr-randr/xrandr
-  → 1920x1080). Origin assumed 0,0; also clamps incoming `move_abs`.
+- `src/screen.rs` — desktop bounds in logical coords (env override → Quartz via enigo → niri /
+  hyprctl / wlr-randr / xrandr → 1920x1080). Keeps the real origin (`ox`/`oy`); also clamps
+  incoming `move_abs`.
 - `web/arrange.js` — arrangement + edge-crossing geometry, pure and DOM-free so it can be
   unit-tested (`web/arrange.test.mjs`). `web/app.js` is an ES module because of this import.
 - `src/wake.rs` — wake lock: holds `caffeinate -d -i -w <pid>` (mac) / `systemd-inhibit …
@@ -276,7 +220,7 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
 ## Open threads / next steps
 
 - **AUTH — top priority, and the gap widened.** There is no authentication of any kind:
-  anyone who can reach the port can inject input, read live screen crops, and drive dictation.
+  anyone who can reach the port can inject input and drive dictation.
   mDNS advertises the daemon, so they don't even have to look for it. TLS is on but
   self-signed, so it gives confidentiality, not identity. Port 8443 itself is fine.
   Design sketch: random 256-bit token per daemon in `$XDG_STATE_HOME/remoat` (next to the
@@ -290,8 +234,8 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
     order matters to the app — see `handle_socket`). They leak hostname and resolution to an
     unauthenticated peer, so they have to move after auth *without* breaking the ordering the
     client depends on.
-  - **Gate every path, not just input.** `capture` (live screen), `stt_start` + binary audio,
-    and `wake` are all separately reachable today.
+  - **Gate every path, not just input.** `stt_start` + binary audio and `wake` are separately
+    reachable today.
   - **One token per daemon, and the phone holds sockets to ALL of them** (edge crossing needs
     them open). So pairing is per-device and the arrangement UI already has the right place to
     hang it: the tile's existing `untrusted` state, which currently only means "cert not
@@ -324,14 +268,14 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   unit-tested (`input.rs::keyargs`), the *bindings* aren't.
 - PWA settings screen that edits `commands.toml` over WS (`{type:"config_set",…}`) — the
   file format is ready for it; the WS message is not implemented.
-- **Exact pointer tracking on Linux needs a real absolute device — now the top functional gap,
-  because the touchpad capture makes the drift plainly visible** (it was previously only a
-  crossing-reliability concern). **Flat pointer accel is explicitly rejected as the answer** —
+- **Exact pointer tracking on Linux needs a real absolute device — the top functional gap.**
+  The (since removed) touchpad capture made the drift plainly visible; it remains a
+  crossing-reliability problem. **Flat pointer accel is explicitly rejected as the answer** —
   the user's position, and the right one: a remote-control daemon that only works if you
   reconfigure your compositor is broken by design, not configurable. Treat flat accel as a
   diagnostic for confirming the cause, never as the fix. See the worked example under
-  "Touchpad live capture" for why nothing else *in the current design* can be exact — the
-  design has to change.
+  "Touchpad live capture REMOVED" for why nothing else *in the current design* can be exact —
+  the design has to change.
   Two candidate mechanisms, neither verified:
   - **Own uinput device WITH an ABS range** (`UI_ABS_SETUP` — the call ydotool never makes).
     Needs `/dev/uinput`, i.e. the same group `programs.ydotool.enable` already grants. udev's
@@ -356,22 +300,15 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   argv is untested, and hypridle only honours logind inhibitors when
   `ignore_dbus_inhibit=false` (its default). `wlinhibit` is the no-logind fallback and is the
   one path with no pid leash, so it leans on the SIGTERM handler alone.
-- **Touchpad capture (`src/capture.rs`) is entirely unverified on real hardware** — built and
-  argv-checked from a cloud session with no display. On Linux, confirm `grim` actually captures
-  under Hyprland from this daemon (not just from a terminal) and that `-g` geometry syntax is
-  still correct for the installed grim version. Also unverified: whether 8fps/480×300 is
-  remotely the right tradeoff for real Wi-Fi + a real screenshot's actual latency —
-  CAPTURE_INTERVAL and the crop size are guesses, not measurements.
-- **macOS permissions: Screen Recording CONFIRMED to fail LOUD; Accessibility fails in
-  ABSOLUTE SILENCE, and that silence is structural, not a logging gap.** `screencapture` without
-  Screen Recording permission prints its own error (`cannot create image…`) to stderr; without
-  the fix in `capture.rs` this was spamming that line on every `move_abs` while dragging
-  (~8/sec) instead of explaining anything once.
-  Accessibility is the opposite problem, and it took a real debugging session (reproduced below
+- **macOS permissions: Accessibility fails in ABSOLUTE SILENCE, and that silence is
+  structural, not a logging gap.** (For contrast, while the daemon still screenshotted,
+  `screencapture` without Screen Recording permission printed its own `cannot create image…`
+  to stderr — loud. Screen Recording is no longer needed by anything.)
+  It took a real debugging session (reproduced below
   because the dead ends are as instructive as the answer) to find why: `CGEventPost` — what
   every enigo mouse/keyboard call bottoms out at — is a `void` C function with **no error
   return**. If the process isn't trusted, macOS silently drops the event; enigo's `move_mouse`
-  still returns `Ok(())`. There is no return value, no error, and — unlike ScreenCapture's
+  still returns `Ok(())`. There is no return value, no error, and — unlike Screen Recording's
   request/response flow — no `log stream --predicate 'subsystem == "com.apple.TCC"'` entry
   either, because a raw `CGEventPost` doesn't go through the request-arbitration path that
   generates that log at all. **A blocked cursor and a working one look byte-for-byte identical
@@ -395,8 +332,6 @@ Fat daemon / thin phone. **Daemon consumes _text_** so the STT source is swappab
   that the daemon runs from **Kitty** (`net.kovidgoyal.kitty`, itself a nix store path — same
   rotation problem as remoat's own binary), confirmed for Screen Recording; Accessibility could
   never be confirmed via log at all, which is the whole point above.
-- Screen capture currently ships with **no auth**, same LAN-exposure gap as input (see the
-  security item above) — now covering live screen contents too, not just injection.
 
 **Dynamic command tier BUILT** (`src/apps.rs`, `src/wm.rs`, `src/dynamic.rs`) — commands whose
 *object* only exists at runtime: the windows you have open, the apps you have installed.
@@ -531,10 +466,10 @@ Where the implementation deviates from the original design note:
 - **A dry-run argv check is not hardware verification.** Both ydotool bugs so far (the `-w`
   wheel flags, then this) passed dry-run and failed on the real box.
 - **Screen geometry: everything outside a monitor's own mode is LOGICAL (post-scale).** Pointer
-  positions, compositor layout positions, and `grim -g` all live in logical coordinates; only
+  positions and compositor layout positions live in logical coordinates; only
   `mode.width`/`height` (wlr-randr) and `width`/`height` (hyprctl) are physical. Pairing the two
   is invisible at scale 1 and silently wrong at any other scale — it inflated the desktop and
-  sent capture crops into uncovered space. Divide by `scale`, and prefer a compositor that hands
+  put the cursor into uncovered space. Divide by `scale`, and prefer a compositor that hands
   you the logical rect outright (`niri msg --json outputs` → `logical`). Also: don't assume the
   layout origin is 0,0, and don't assume the union is fully covered by outputs.
 - **`sherpa-onnx-sys` DOWNLOADS a prebuilt archive from GitHub in its build script** unless

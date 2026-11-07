@@ -1,5 +1,4 @@
-//! Desktop geometry — what the phone needs in order to own an absolute cursor, and what
-//! screen capture needs in order to crop the right pixels.
+//! Desktop geometry — what the phone needs in order to own an absolute cursor.
 //!
 //! Edge crossing between arranged devices only works if someone knows where the cursor IS.
 //! Nothing can ask Wayland (uinput is write-only, and there's no protocol for reading the
@@ -7,14 +6,14 @@
 //! sends `move_abs`. For that it needs each device's bounds, which is this module.
 //!
 //! Everything here is in the compositor's **logical** (post-scale) coordinate space, because
-//! that is the space both pointer positions and `grim -g` live in. Reading *physical* mode
-//! sizes and pairing them with logical positions is the bug that made capture crops land off
-//! to the side on a mixed-scale setup — a 3840x2160 panel at scale 2 occupies 1920x1080 of
-//! layout, and using 3840x2160 inflates the desktop into coordinates no output covers.
+//! that is the space pointer positions live in. Reading *physical* mode sizes and pairing them
+//! with logical positions inflates the desktop on a mixed-scale setup — a 3840x2160 panel at
+//! scale 2 occupies 1920x1080 of layout, and using 3840x2160 puts the union into coordinates
+//! no output covers, so the cursor can be driven into empty space.
 //!
 //! The union's origin is NOT assumed to be 0,0: a monitor placed left of or above the primary
-//! puts it negative. The phone still gets a 0-based `w`x`h`, and `Bounds.ox/oy` translates
-//! back when talking to the compositor.
+//! puts it negative. The phone still gets a 0-based `w`x`h`; `Bounds.ox/oy` keeps the real
+//! origin for anything that talks to the compositor in its own coordinates.
 //!
 //! `REMOAT_SCREEN=WxH` overrides everything.
 
@@ -31,24 +30,10 @@ pub struct Rect {
     pub h: i32,
 }
 
-impl Rect {
-    pub fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
-    }
-
-    /// Squared distance from a point to this rect (0 when inside). Used to pick the nearest
-    /// output for a cursor that landed in an uncovered gap of the desktop union.
-    pub fn dist2(&self, x: i32, y: i32) -> i64 {
-        let dx = (self.x - x).max(x - (self.x + self.w - 1)).max(0) as i64;
-        let dy = (self.y - y).max(y - (self.y + self.h - 1)).max(0) as i64;
-        dx * dx + dy * dy
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bounds {
     /// Logical origin of the desktop union. Usually 0,0; negative when a monitor sits left of
-    /// or above the primary. The phone never sees this — it works in 0..w-1 — but capture does.
+    /// or above the primary. The phone never sees this — it works in 0..w-1.
     pub ox: i32,
     pub oy: i32,
     pub w: i32,
@@ -56,7 +41,7 @@ pub struct Bounds {
 }
 
 /// The desktop as both one rectangle (what the phone drives a cursor in) and its individual
-/// monitors (what capture clamps into, so a crop can't spill into an uncovered gap).
+/// monitors (logged at startup so a wrong probe is visible, not silent).
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub bounds: Bounds,
@@ -176,7 +161,7 @@ fn parse_niri(v: &serde_json::Value) -> Option<Layout> {
 
 /// Hyprland: `hyprctl monitors -j` positions in logical coordinates but reports `width`/
 /// `height` as the *physical* mode, so both must be divided by `scale` to get the logical
-/// rect. Mixing the two is what broke capture on a scale-2 monitor.
+/// rect. Mixing the two inflates the union on a scale-2 monitor.
 #[cfg(not(target_os = "macos"))]
 fn hyprland_layout() -> Option<Layout> {
     let out = Command::new("hyprctl").args(["monitors", "-j"]).output().ok()?;
@@ -248,7 +233,7 @@ fn xrandr_layout() -> Option<Layout> {
 }
 
 /// Monitor rects -> the layout: their bounding box plus the rects themselves. The box may have
-/// a negative origin; capture needs that, the phone works 0-based off `w`/`h`.
+/// a negative origin; the phone works 0-based off `w`/`h`.
 fn layout_of(rects: impl Iterator<Item = Rect>) -> Option<Layout> {
     let monitors: Vec<Rect> = rects.filter(|r| r.w > 0 && r.h > 0).collect();
     if monitors.is_empty() {
@@ -304,7 +289,7 @@ mod tests {
     #[test]
     fn union_keeps_a_negative_origin() {
         // A monitor above/left of the primary puts the layout origin negative. Assuming 0,0
-        // here would shift every capture crop by the whole offset.
+        // here would offset every compositor-space coordinate by the whole shift.
         let l = layout_of([rect(0, 0, 1920, 1080), rect(-2560, -400, 2560, 1440)].into_iter()).unwrap();
         assert_eq!(l.bounds, Bounds { ox: -2560, oy: -400, w: 4480, h: 1480 });
     }
@@ -315,10 +300,9 @@ mod tests {
         assert!(layout_of([rect(0, 0, 0, 0)].into_iter()).is_none());
     }
 
-    // The mixed-scale case that broke capture on real hardware: a laptop panel at scale 1
-    // beside a 4K external at scale 2. The external occupies 1920x1080 of LAYOUT, not
-    // 3840x2160 — reading the physical mode inflated the desktop into coordinates no output
-    // covers, so grim returned black bars and every crop sat off to the side.
+    // The mixed-scale case seen on real hardware: a laptop panel at scale 1 beside a 4K
+    // external at scale 2. The external occupies 1920x1080 of LAYOUT, not 3840x2160 — reading
+    // the physical mode inflated the desktop into coordinates no output covers.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn niri_reads_logical_rects_verbatim() {

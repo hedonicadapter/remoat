@@ -78,11 +78,6 @@ main#pad {
   background: var(--pad); border: 1px solid var(--line); border-radius: 16px;
   overflow: hidden; touch-action: none;
 }
-#padcap {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-  object-fit: cover; opacity: 0; transition: opacity .15s; pointer-events: none;
-}
-#padcap.show { opacity: 1; }
 #vbar { grid-column: 2; grid-row: 1; }
 #hbar { grid-column: 1; grid-row: 2; }
 .scrollbar {
