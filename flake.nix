@@ -13,9 +13,7 @@
         inherit (pkgs) lib stdenv;
 
         # Tools the daemon shells out to at runtime. Linux/Wayland needs ydotool +
-        # wl-clipboard; grim captures the touchpad's live cursor-area preview via
-        # wlr-screencopy (Hyprland and other wlroots compositors); openssl is not required
-        # by the Rust build (rcgen) but harmless.
+        # wl-clipboard; openssl is not required by the Rust build (rcgen) but harmless.
         # wlr-randr is the screen-bounds fallback for compositors without their own IPC
         # (niri and Hyprland are queried directly); it was referenced by screen.rs long
         # before it was ever actually on PATH, which silently forced the 1920x1080 default.
@@ -26,7 +24,7 @@
         # out to. Learned the hard way with wlr-randr: a tool referenced in code is not a tool
         # on PATH.
         runtimeTools = lib.optionals stdenv.isLinux
-          (with pkgs; [ ydotool wl-clipboard xdg-utils grim wlr-randr curl gnutar bzip2 ]);
+          (with pkgs; [ ydotool wl-clipboard xdg-utils wlr-randr curl gnutar bzip2 ]);
 
         src = builtins.path {
           name = "remoat-src";

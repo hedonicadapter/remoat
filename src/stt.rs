@@ -322,7 +322,7 @@ pub fn diff(prev: &str, next: &str) -> Edit {
 }
 
 /// Download and unpack the model. Shells out to `curl` and `tar`, matching how the rest of the
-/// daemon reaches platform tooling (ydotool, grim, screencapture) — that keeps an HTTP client
+/// daemon reaches platform tooling (ydotool, the compositor CLIs) — that keeps an HTTP client
 /// and a bzip2 decoder out of the dependency tree for something run once.
 ///
 /// Deliberately a separate command rather than an automatic first-run download: it is ~122 MB,
@@ -432,8 +432,7 @@ mod tests {
 
     // ---- real decode against the model's own reference wavs ----
     // Skipped when the model isn't installed, so `cargo test` still passes on a clean checkout.
-    // This is the check the capture feature never had: it exercises the actual engine, not just
-    // argv or arithmetic. Run after `remoat --fetch-model`.
+    // Exercises the actual engine, not just argv or arithmetic. Run after `remoat --fetch-model`.
 
     /// One engine for every real-decode test. Loading a 70MB model per test and running four
     /// recognizers concurrently on a small box just contends for cores — and ONNX intra-op
